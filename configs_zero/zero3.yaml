@@ -1,43 +1,96 @@
-{
-    "bf16": {
-        "enabled": true
-    },
-    "optimizer": {
-        "type": "AdamW",
-        "params": {
-            "lr": "auto",
-            "weight_decay": "auto",
-            "torch_adam": true,
-            "adam_w_mode": true
-        }
-    },
-    "scheduler": {
-        "type": "WarmupDecayLR",
-        "params": {
-            "warmup_min_lr": "auto",
-            "warmup_max_lr": "auto",
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
-        }
-    },
-    "zero_optimization": {
-        "stage": 3,
-        "overlap_comm": true,
-        "contiguous_gradients": true,
-        "reduce_bucket_size": 5e8,
-        "stage3_prefetch_bucket_size": "auto",
-        "stage3_param_persistence_threshold": "auto",
-        "sub_group_size": 1e9,
-        "stage3_max_live_parameters": 1e9,
-        "stage3_max_reuse_distance": 1e9,
-        "stage3_gather_16bit_weights_on_model_save": "auto",
-        "stage3_prefetch_bucket_size": 5e8,
-        "stage3_param_persistence_threshold": 1e5
-    },
-    "gradient_accumulation_steps": 1,
-    "train_micro_batch_size_per_gpu": 1,
-    "train_batch_size": "auto",
-    "gradient_clipping": "auto",
-    "steps_per_print": 2000,
-    "wall_clock_breakdown": false
-}
+# =============================================================================
+# DeepSpeed ZeRO Stage 3 配置
+#
+# ZeRO-3 在 ZeRO-2 基础上进一步将模型参数也分片到各 GPU：
+#   每张 GPU 只存储 1/N 份参数 + 1/N 份梯度 + 1/N 份优化器状态
+#   前向/反向传播时通过 AllGather 临时收集所需参数，用完即丢弃
+#
+# 显存对比（以 14B bf16 模型、8 GPU 为例，粗略估算）：
+#   Full Model (no ZeRO) : ~28GB 参数 + ~28GB 梯度 + ~112GB 优化器 ≈ 168GB/卡
+#   ZeRO-2               : ~28GB 参数 + (~28+112)/8 ≈ 45GB/卡
+#   ZeRO-3（本配置）      : (~28+28+112)/8 ≈ 21GB/卡
+#
+# 代价：
+#   - 每层计算前后各需一次 AllGather（参数）和 ReduceScatter（梯度）
+#   - 通信量约为 ZeRO-2 的 1.5 倍
+#   - 配合 8gpu_zero3.yaml 中的 zero3_init_flag: true 使用
+#
+# 关联文件：
+#   - Accelerate 配置  : configs_acc/8gpu_zero3.yaml
+#   - Offload 扩展版   : configs_zero/zero3_offload.yaml
+#   - Checkpoint 转换  : scripts/zero_to_fp32.py
+#
+# 注意：zero3.yaml 原始 JSON 版本中存在重复 key，
+#       此 YAML 版已去重，保留语义上的最终有效值：
+#         stage3_prefetch_bucket_size        → 5e8（覆盖 "auto"）
+#         stage3_param_persistence_threshold → 1e5（覆盖 "auto"）
+# =============================================================================
+
+bf16:
+  enabled: true
+
+optimizer:
+  type: AdamW
+  params:
+    lr: "auto"
+    weight_decay: "auto"
+    torch_adam: true
+    adam_w_mode: true
+
+scheduler:
+  type: WarmupDecayLR
+  params:
+    warmup_min_lr: "auto"
+    warmup_max_lr: "auto"
+    warmup_num_steps: "auto"
+    total_num_steps: "auto"
+
+zero_optimization:
+  stage: 3 # ZeRO Stage 3：分片参数 + 梯度 + 优化器状态
+
+  # 通信与计算重叠（同 ZeRO-2）
+  overlap_comm: true
+  contiguous_gradients: true
+
+  # ReduceScatter 桶大小（同 ZeRO-2 含义）
+  reduce_bucket_size: 5.0e+8
+
+  # ── ZeRO-3 特有配置 ────────────────────────────────────────────────────────
+
+  # 参数预取桶大小：
+  #   ZeRO-3 在前向传播时提前 AllGather 下一层参数（预取）以隐藏通信延迟
+  #   5e8 表示每次预取约 500M 个元素（1GB bf16）
+  stage3_prefetch_bucket_size: 5.0e+8
+
+  # 参数常驻阈值：
+  #   参数量 ≤ 此值的参数不做分片，常驻每张 GPU
+  #   避免对极小参数（如 bias、LayerNorm weight）的频繁 AllGather
+  #   1e5 = 100K 个参数，约 200KB（bf16），小于此阈值的层不分片
+  stage3_param_persistence_threshold: 1.0e+5
+
+  # 优化器 sub-group 大小：
+  #   ZeRO-3 的 CPU Offload 模式下，将参数分成 sub-group 逐批执行优化器步骤
+  #   纯 GPU 模式（本配置）下此参数影响有限
+  sub_group_size: 1.0e+9
+
+  # 前向/反向传播过程中，同时存活的最大参数量（AllGather 后的完整参数）
+  #   超出此限制时，已使用过的参数会被提前释放
+  #   设置过小会导致频繁重新 AllGather，设置过大会占用过多显存
+  stage3_max_live_parameters: 1.0e+9
+
+  # 参数复用距离阈值：
+  #   若某参数在 N 步内会被再次使用（N ≤ 此值），则保留不释放以避免重复 AllGather
+  #   1e9 相当于"始终保留"，在显存充足时可加速训练
+  stage3_max_reuse_distance: 1.0e+9
+
+  # 模型保存时是否收集完整的 16bit 权重：
+  #   "auto" — 由 DeepSpeed 根据保存策略自动决定
+  #   若使用 scripts/zero_to_fp32.py 手动转换，可设为 false 跳过此步骤
+  stage3_gather_16bit_weights_on_model_save: "auto"
+
+gradient_accumulation_steps: 1
+train_micro_batch_size_per_gpu: 1
+train_batch_size: "auto"
+gradient_clipping: "auto"
+steps_per_print: 2000
+wall_clock_breakdown: false

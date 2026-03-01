@@ -1,15 +1,61 @@
+# =============================================================================
+# Accelerate 配置 — 8 GPU + DeepSpeed ZeRO Stage 2（默认训练配置）
+#
+# 这是 finetune.sh 中 LAUNCHER 使用的主配置文件。
+#
+# 核心设计：
+#   - 8 张 GPU 并行，通过 DeepSpeed ZeRO-2 降低显存占用
+#   - ZeRO-2 将梯度和优化器状态分片到各 GPU，模型参数仍在每卡完整存储
+#   - 相比 ZeRO-3，通信开销更低、实现更稳定，适合 14B 模型的 LoRA 微调
+#
+# DeepSpeed ZeRO 各阶段节省显存的原理（供参考）：
+#   ZeRO-1：仅分片优化器状态                          → 节省约 4x 优化器显存
+#   ZeRO-2：分片优化器状态 + 梯度（本配置）            → 节省约 8x
+#   ZeRO-3：分片优化器状态 + 梯度 + 模型参数          → 节省约 64x，但通信开销最大
+#
+# 关联文件：
+#   - DeepSpeed 细节配置 : configs_zero/zero2.yaml
+#   - 启动脚本           : scripts/finetune.sh
+#   - ZeRO-3 对应配置   : configs_acc/8gpu_zero3.yaml
+#
+# 启动命令示例：
+#   accelerate launch --config_file configs_acc/8gpu.yaml finetune.py ...
+# =============================================================================
+
 compute_environment: LOCAL_MACHINE
 
+# 使用全部 8 张 GPU（GPU 0-7）
 gpu_ids: "0,1,2,3,4,5,6,7"
-num_processes: 8  # should be the same as the number of GPUs
+
+# 进程总数必须与 GPU 数量一致；同时需与 finetune.sh 的 NUM_PROCESSES 保持一致
+num_processes: 8 # should be the same as the number of GPUs
 
 debug: false
+
+# ── DeepSpeed 集成配置 ───────────────────────────────────────────────────────
 deepspeed_config:
-  deepspeed_config_file: configs_zero/zero2.yaml  # e.g. configs/zero2.yaml, need use absolute path
+  # ZeRO 优化详细参数配置文件（JSON 或 YAML 格式均可）
+  # 包含优化器、精度、梯度分片策略等细节，见 configs_zero/zero2.yaml
+  deepspeed_config_file: configs_zero/zero2.yaml # e.g. configs/zero2.yaml, need use absolute path
+
+  # ZeRO-3 参数分片初始化标志：
+  #   false — ZeRO-2 无需此选项（参数不分片，初始化与普通训练相同）
+  #   true  — 仅 ZeRO-3 需要，在模型构建时即分片参数（见 8gpu_zero3.yaml）
   zero3_init_flag: false
+
+  # 多节点启动器类型：
+  #   standard — 使用 torchrun/mpirun 等标准启动方式
+  #   openmpi  — 使用 OpenMPI（多节点 HPC 场景）
   deepspeed_multinode_launcher: standard
+
+# 启用 DeepSpeed 分布式训练后端
 distributed_type: DEEPSPEED
-downcast_bf16: 'no'
+
+# bf16 混合精度训练下，是否将 fp32 中间量强制向下转换为 bf16 以节省显存。
+# mixed_precision 由 finetune.sh 的 --mixed_precision bf16 控制；
+# 此处 'no' 表示保留 fp32 中间量，loss scale 等关键操作的数值精度更稳定。
+downcast_bf16: "no"
+
 enable_cpu_affinity: false
 machine_rank: 0
 main_training_function: main

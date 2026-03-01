@@ -1,3 +1,7 @@
+refer/
+videos/
+vis_out/
+
 __pycache__/
 build/
 *.egg-info/
@@ -7,6 +11,7 @@ venv_*/
 .vscode/
 .idea/
 .deepspeed_env
+.DS_Store
 
 tmp_*
 data?

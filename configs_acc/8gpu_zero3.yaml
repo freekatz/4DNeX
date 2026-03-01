@@ -1,15 +1,57 @@
+# =============================================================================
+# Accelerate 配置 — 8 GPU + DeepSpeed ZeRO Stage 3（极限显存优化）
+#
+# 适用场景：
+#   - 单卡显存不足以加载完整模型参数时（如全参 SFT 微调 14B 模型）
+#   - 需要在 8 卡以下机器跑 14B+ 模型时
+#   - 可接受更高通信开销以换取更低峰值显存
+#
+# 与 8gpu.yaml（ZeRO-2）的关键区别：
+#   ┌───────────────┬──────────────┬──────────────┐
+#   │               │   ZeRO-2     │   ZeRO-3     │
+#   ├───────────────┼──────────────┼──────────────┤
+#   │ 优化器状态    │ 分片 ✓       │ 分片 ✓       │
+#   │ 梯度          │ 分片 ✓       │ 分片 ✓       │
+#   │ 模型参数      │ 每卡完整副本 │ 分片 ✓       │
+#   │ 通信开销      │ 较低         │ 较高         │
+#   │ 初始化方式    │ 普通         │ 需特殊初始化 │
+#   └───────────────┴──────────────┴──────────────┘
+#
+# 关联文件：
+#   - DeepSpeed 细节配置 : configs_zero/zero3.yaml
+#   - ZeRO-2 配置（默认）: configs_acc/8gpu.yaml
+#
+# 注意事项：
+#   - ZeRO-3 下 LoRA 初始化需确保 peft 与 DeepSpeed 的兼容性
+#   - 推理/保存时需调用 zero3_gather_16bit_weights() 收集完整参数
+#   - 首次使用建议先验证 zero3.yaml 中的参数配置
+# =============================================================================
+
 compute_environment: LOCAL_MACHINE
 
 gpu_ids: "0,1,2,3,4,5,6,7"
-num_processes: 8  # should be the same as the number of GPUs
+num_processes: 8 # should be the same as the number of GPUs
 
 debug: false
+
+# ── DeepSpeed ZeRO-3 集成配置 ────────────────────────────────────────────────
 deepspeed_config:
-  deepspeed_config_file: configs_zero/zero3.yaml  # e.g. configs/zero2.yaml, need use absolute path
+  # ZeRO-3 详细参数配置文件，包含参数分片策略和预取策略
+  # 见 configs_zero/zero3.yaml
+  deepspeed_config_file: configs_zero/zero3.yaml # e.g. configs/zero2.yaml, need use absolute path
+
+  # ZeRO-3 必须设为 true：
+  #   在 model = MyModel() 构建阶段即进行参数分片，
+  #   避免完整模型在任何单卡上出现 OOM
+  #   若设为 false，模型会先完整加载再分片，大模型可能因此 OOM
   zero3_init_flag: true
+
   deepspeed_multinode_launcher: standard
+
 distributed_type: DEEPSPEED
-downcast_bf16: 'no'
+# bf16 混合精度训练下，是否将 fp32 中间量强制向下转换为 bf16 以节省显存。
+# 'no'：保留 fp32 中间量（推荐）；'yes'：全部转为 bf16，省显存但有精度风险。
+downcast_bf16: "no"
 enable_cpu_affinity: false
 machine_rank: 0
 main_training_function: main

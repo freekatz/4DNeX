@@ -1,18 +1,63 @@
+# =============================================================================
+# Accelerate 配置 — 单 GPU（调试 / 快速验证）
+#
+# 适用场景：
+#   - 代码调试、单样本跑通流程
+#   - 显存充足时的小规模实验
+#   - 不需要分布式通信开销
+#
+# 启动方式（会被 finetune.sh 中的 LAUNCHER 变量引用）：
+#   accelerate launch --config_file configs_acc/1gpu.yaml finetune.py ...
+# =============================================================================
+
+# 运行环境：本地单机（区别于 AMAZON_SAGEMAKER / GOOGLE_CLOUD 等云平台）
 compute_environment: LOCAL_MACHINE
 
+# 指定使用的 GPU 编号；单 GPU 训练仅使用 GPU 0
 gpu_ids: "0"
+
+# 进程总数：单 GPU 训练只有 1 个进程
 num_processes: 1
 
+# 关闭额外的 Accelerate 调试日志（设为 true 可输出更多内部状态信息）
 debug: false
-distributed_type: 'NO'
-downcast_bf16: 'no'
+
+# 分布式训练类型：
+#   NO       — 不使用任何分布式框架，等价于原生单 GPU 训练
+#   DEEPSPEED — 使用 DeepSpeed（见 8gpu.yaml）
+#   MULTI_GPU — 使用 PyTorch DDP（见 4gpu.yaml）
+distributed_type: "NO"
+
+# bf16 混合精度训练下，是否将 fp32 中间量强制向下转换为 bf16 以节省显存。
+# 'no'：保留 fp32 中间量（推荐）；loss scale、LayerNorm 等操作在 fp32 下数值更稳定。
+# 'yes'：所有 fp32 结果也强制转为 bf16，可进一步省显存，但有精度风险。
+downcast_bf16: "no"
+
+# CPU 亲和性绑定：将进程绑定到特定 CPU 核心以减少 NUMA 跨节点访问；
+# 多 GPU 高吞吐训练时可考虑开启，单 GPU 通常无需
 enable_cpu_affinity: false
+
+# 当前节点编号（0-indexed）；单机训练固定为 0
 machine_rank: 0
+
+# Accelerate 将调用的训练入口函数名，对应 finetune.py 中的 main()
 main_training_function: main
+
+# 参与训练的总节点数；单机固定为 1
 num_machines: 1
+
+# RendezVous 后端策略：
+#   static  — 静态拓扑，适合节点数固定的场景（单机/固定多机）
+#   c10d    — 动态发现，适合弹性训练
 rdzv_backend: static
+
+# 所有进程是否在同一局域网内（影响 NCCL 的通信策略优化）
 same_network: true
+
+# TPU 相关配置（不使用 TPU，保持默认关闭）
 tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
+
+# 是否强制使用 CPU 进行训练（调试用，正式训练必须为 false）
 use_cpu: false

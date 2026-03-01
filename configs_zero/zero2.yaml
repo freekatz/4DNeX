@@ -1,38 +1,87 @@
-{
-    "bf16": {
-        "enabled": true
-    },
-    "optimizer": {
-        "type": "AdamW",
-        "params": {
-            "lr": "auto",
-            "weight_decay": "auto",
-            "torch_adam": true,
-            "adam_w_mode": true
-        }
-    },
-    "scheduler": {
-        "type": "WarmupDecayLR",
-        "params": {
-            "warmup_min_lr": "auto",
-            "warmup_max_lr": "auto",
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
-        }
-    },
-    "zero_optimization": {
-        "stage": 2,
-        "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
-        "overlap_comm": true,
-        "reduce_scatter": true,
-        "reduce_bucket_size": 5e8,
-        "contiguous_gradients": true
-    },
-    "gradient_accumulation_steps": 1,
-    "train_micro_batch_size_per_gpu": 1,
-    "train_batch_size": "auto",
-    "gradient_clipping": "auto",
-    "steps_per_print": 2000,
-    "wall_clock_breakdown": false
-}
+# =============================================================================
+# DeepSpeed ZeRO Stage 2 配置
+#
+# 显存节省原理：
+#   将梯度和优化器状态（Adam 的 momentum/variance）均匀分片到各 GPU，
+#   每张 GPU 只维护 1/N 份梯度和优化器状态（N = GPU 数量）。
+#   模型参数仍在每张 GPU 上保有完整副本。
+#
+#   与 ZeRO-1 相比额外节省了梯度显存；
+#   与 ZeRO-3 相比无需对参数做 AllGather，前向/反向计算开销更小。
+#
+# 适用场景（对应 configs_acc/8gpu.yaml）：
+#   - 14B 模型 LoRA 微调（本项目默认配置）
+#   - 8 × 80GB A100/H100，batch_size=1，bf16 精度
+#
+# "auto" 的含义：
+#   Accelerate 在启动时会将 finetune.sh 中对应的训练超参（lr、batch size 等）
+#   注入到 DeepSpeed 配置中，"auto" 表示由 Accelerate 自动填充该值。
+# =============================================================================
+
+# ── 混合精度 ──────────────────────────────────────────────────────────────────
+bf16:
+  # 启用 bfloat16 混合精度；与 finetune.sh 的 --mixed_precision bf16 联动
+  # bf16 动态范围比 fp16 更大，14B 大模型训练更稳定
+  enabled: true
+
+# ── 优化器 ───────────────────────────────────────────────────────────────────
+optimizer:
+  type: AdamW
+  params:
+    lr: "auto" # 由 Accelerate 从 --learning_rate 注入（默认 2e-5）
+    weight_decay: "auto" # 由 Accelerate 从 --weight_decay 注入（默认 1e-4）
+    torch_adam:
+      true # 使用 PyTorch 原生 AdamW 实现，而非 DeepSpeed 自带的 FusedAdam
+      # 与 bf16 + LoRA 的兼容性更好
+    adam_w_mode: true # 启用 AdamW 模式（解耦权重衰减），等价于 PyTorch AdamW
+
+# ── 学习率调度器 ──────────────────────────────────────────────────────────────
+scheduler:
+  type: WarmupDecayLR # 线性 warmup + 线性 decay
+  params:
+    warmup_min_lr: "auto" # warmup 起始 lr（通常为 0，由 Accelerate 填充）
+    warmup_max_lr: "auto" # warmup 峰值 lr（= learning_rate，由 Accelerate 填充）
+    warmup_num_steps: "auto" # warmup 步数（由 --lr_warmup_steps 填充，默认 100）
+    total_num_steps: "auto" # 总训练步数（由 train_epochs × steps_per_epoch 填充）
+
+# ── ZeRO 优化核心配置 ─────────────────────────────────────────────────────────
+zero_optimization:
+  stage: 2 # ZeRO Stage 2：分片梯度 + 优化器状态
+
+  # AllGather 配置（前向传播时收集完整参数）
+  allgather_partitions: true # 使用分区 AllGather 替代整体广播，降低峰值通信缓冲区大小
+  allgather_bucket_size:
+    2.0e+8 # AllGather 通信桶大小（约 200M 个元素 × 2B = 400MB）
+    # 较小值：通信频率高但峰值显存低
+    # 较大值：通信次数少但需要更多临时缓冲区显存
+
+  # 通信与计算重叠
+  overlap_comm:
+    true # 将梯度 Reduce 通信与反向传播计算重叠，
+    # 隐藏通信延迟，提升 GPU 利用率
+
+  # ReduceScatter 配置（梯度聚合）
+  reduce_scatter:
+    true # 用 ReduceScatter 替代 AllReduce 进行梯度聚合：
+    # 每张 GPU 只收到自己负责的那 1/N 份梯度，
+    # 显存占用从 O(G) 降为 O(G/N)，G = 梯度总大小
+  reduce_bucket_size:
+    5.0e+8 # ReduceScatter 通信桶大小（约 500M 元素 × 2B = 1GB）
+    # 推荐值通常设为 allgather_bucket_size 的 2-4 倍
+
+  # 梯度连续性优化
+  contiguous_gradients:
+    true # 将梯度复制到连续内存缓冲区后再通信：
+    # 1. 避免内存碎片导致的低效通信
+    # 2. 对底层 NCCL AllReduce/ReduceScatter 更友好
+    # 代价：额外使用约等于一份梯度大小的显存
+
+# ── 全局训练配置 ──────────────────────────────────────────────────────────────
+gradient_accumulation_steps: 1 # 与 finetune.sh --gradient_accumulation_steps 保持一致
+train_micro_batch_size_per_gpu: 1 # 单 GPU micro batch size，与 --batch_size 对应
+train_batch_size: "auto" # 全局 batch = micro_batch × gpu数 × grad_accum，由 Accelerate 计算
+gradient_clipping: "auto" # 梯度裁剪阈值，由 --max_grad_norm 填充（默认 1.0）
+
+# ── 日志与调试 ────────────────────────────────────────────────────────────────
+steps_per_print: 2000 # 每 2000 步打印一次 DeepSpeed 内部训练日志
+wall_clock_breakdown: false # 关闭各算子耗时的详细统计（开启会有额外开销，调优时使用）

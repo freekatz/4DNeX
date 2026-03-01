@@ -1,13 +1,43 @@
+# =============================================================================
+# Accelerate 配置 — 4 GPU，PyTorch DDP（无 DeepSpeed）
+#
+# 适用场景：
+#   - 4 卡机器上进行中等规模实验
+#   - 模型参数量可放入单卡显存（无需 ZeRO 分片）
+#   - 希望避免 DeepSpeed 依赖，使用原生 PyTorch DistributedDataParallel
+#
+# 与 8gpu.yaml 的关键区别：
+#   - distributed_type: 'NO' 而非 DEEPSPEED
+#     → Accelerate 在 num_processes > 1 时会自动使用 DDP，'NO' 指不使用额外框架
+#   - 无 deepspeed_config 配置块
+#     → 每张 GPU 保存完整的模型参数、梯度和优化器状态
+#
+# 启动命令示例：
+#   accelerate launch --config_file configs_acc/4gpu.yaml finetune.py ...
+# =============================================================================
+
 compute_environment: LOCAL_MACHINE
 
+# 使用 GPU 0-3，共 4 张；与 num_processes 数量对应
 gpu_ids: "0,1,2,3"
+
+# DDP 进程数，每个进程占用一张 GPU；必须与 gpu_ids 数量一致
 num_processes: 4
 
 debug: false
-distributed_type: 'NO'
-downcast_bf16: 'no'
+
+# 不叠加额外分布式框架；4 进程时 Accelerate 内部自动启用 PyTorch DDP
+# 若需要 DeepSpeed 显存优化，请改用 8gpu.yaml 对应的配置
+distributed_type: "NO"
+
+# bf16 混合精度训练下，是否将 fp32 中间量强制向下转换为 bf16 以节省显存。
+# 'no'：保留 fp32 中间量（推荐）；'yes'：全部转为 bf16，省显存但有精度风险。
+downcast_bf16: "no"
 enable_cpu_affinity: false
+
+# 单机训练，节点编号恒为 0
 machine_rank: 0
+
 main_training_function: main
 num_machines: 1
 rdzv_backend: static

@@ -1,42 +1,67 @@
-{
-    "bf16": {
-        "enabled": true
-    },
-    "optimizer": {
-        "type": "AdamW",
-        "params": {
-            "lr": "auto",
-            "weight_decay": "auto",
-            "torch_adam": true,
-            "adam_w_mode": true
-        }
-    },
-    "scheduler": {
-        "type": "WarmupDecayLR",
-        "params": {
-            "warmup_min_lr": "auto",
-            "warmup_max_lr": "auto",
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
-        }
-    },
-    "zero_optimization": {
-        "stage": 2,
-        "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
-        "overlap_comm": true,
-        "reduce_scatter": true,
-        "reduce_bucket_size": 5e8,
-        "contiguous_gradients": true,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        }
-    },
-    "gradient_accumulation_steps": 1,
-    "train_micro_batch_size_per_gpu": 1,
-    "train_batch_size": "auto",
-    "gradient_clipping": "auto",
-    "steps_per_print": 2000,
-    "wall_clock_breakdown": false
-}
+# =============================================================================
+# DeepSpeed ZeRO Stage 2 + CPU Offload 配置
+#
+# 在 ZeRO-2 基础上，将优化器状态（Adam momentum/variance）卸载到 CPU 内存，
+# 进一步释放 GPU 显存，代价是增加 CPU↔GPU 数据传输开销。
+#
+# 显存节省对比：
+#   zero2.yaml          : GPU 保存梯度 + 优化器状态（分片）
+#   zero2_offload.yaml  : GPU 仅保存梯度（分片），优化器状态在 CPU
+#
+# 适用场景：
+#   - GPU 显存接近上限，ZeRO-2 仍然 OOM
+#   - 机器 CPU 内存充足（建议 ≥ 512GB）
+#   - 可接受轻微的训练速度下降（通常 10-30%，取决于 PCIe 带宽）
+#
+# 注意：
+#   - CPU 优化器步骤在 CPU 上串行执行，GPU 在此期间空闲
+#   - NVLink 或 PCIe 4.0/5.0 带宽越高，offload 开销越小
+#   - 如果 OOM 仍未解决，考虑升级为 zero3_offload.yaml
+# =============================================================================
+
+bf16:
+  enabled: true
+
+optimizer:
+  type: AdamW
+  params:
+    lr: "auto"
+    weight_decay: "auto"
+    torch_adam: true
+    adam_w_mode: true
+
+scheduler:
+  type: WarmupDecayLR
+  params:
+    warmup_min_lr: "auto"
+    warmup_max_lr: "auto"
+    warmup_num_steps: "auto"
+    total_num_steps: "auto"
+
+zero_optimization:
+  stage: 2
+
+  allgather_partitions: true
+  allgather_bucket_size: 2.0e+8
+  overlap_comm: true
+  reduce_scatter: true
+  reduce_bucket_size: 5.0e+8
+  contiguous_gradients: true
+
+  # ── CPU Offload（ZeRO-2 相对于 zero2.yaml 新增的配置）─────────────────────
+  offload_optimizer:
+    device:
+      cpu # 将 Adam 的 momentum（m）和 variance（v）卸载到 CPU 内存
+      # 对于 14B bf16 模型，优化器状态约占 ~56GB，卸载后 GPU 可释放约 7GB/卡
+    pin_memory:
+      true # 使用锁页（pinned）内存：
+      # 1. 允许 CPU↔GPU 异步 DMA 传输（cudaMemcpyAsync）
+      # 2. 避免操作系统将该内存页换出，降低传输延迟
+      # 代价：锁页内存不可被 OS 回收，需确保系统物理内存充足
+
+gradient_accumulation_steps: 1
+train_micro_batch_size_per_gpu: 1
+train_batch_size: "auto"
+gradient_clipping: "auto"
+steps_per_print: 2000
+wall_clock_breakdown: false

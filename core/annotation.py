@@ -30,13 +30,13 @@ class PexelsAnno:
     @staticmethod
     def _get_caption(video_path):
         if 'static_1' in video_path:
-            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-3]}_with_caption_upload.csv')
+            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-3]}.csv')
             number_str = video_path.split('/')[-2]
         if 'static_2' in video_path:
-            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-2]}_with_caption_upload.csv')
+            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-2]}.csv')
             number_str = video_path.split('/')[-1].split('.')[0]
         elif 'dynamic' in video_path:
-            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-2]}_with_caption_upload.csv')
+            df = pd.read_csv(f'./data/caption/{video_path.split("/")[-2]}.csv')
             number_str = video_path.split('/')[-1].split('.')[0]
         
         def get_caption_by_number(number):
@@ -81,7 +81,7 @@ class Monst3RAnno:
                 K=None,    # [T, 3, 3]
                 depth=None,  # [T, H, W, 3]
             )
-        elif 'dynamic' in anno_dir and 'dynamic_3' not in anno_dir:
+        else:
             rgb, rgb_raw, depth, camera_pose, camera_intrinscis, dynamic_mask = self._load_annotation_dynamic()
             global_ptmaps, colors = self._get_point_cloud(rgb, depth, camera_pose, camera_intrinscis)
             self.pointmap = Pointmap(
@@ -93,19 +93,6 @@ class Monst3RAnno:
                 K=camera_intrinscis,    # [T, 3, 3]
                 depth=depth,  # [T, H, W, 3]
             )
-        elif 'dynamic_3' in anno_dir:
-            rgb, rgb_raw, depth, camera_pose, camera_intrinscis, dynamic_mask = self._load_annotation_dynamic_3()
-            global_ptmaps, colors = self._get_point_cloud(rgb, depth, camera_pose, camera_intrinscis)
-            self.pointmap = Pointmap(
-                pcd=global_ptmaps,    # [T, HxW, 3]
-                colors=colors,  # [T, HxW, 3]
-                rgb=rgb,    # [T, H, W, 3]
-                mask= dynamic_mask.reshape([self.length, -1]),  # [T, HxW]
-                cams2world=camera_pose, # [T, 4, 4]
-                K=camera_intrinscis,    # [T, 3, 3]
-                depth=depth,  # [T, H, W, 3]
-            )
-
 
         self.rgb_raw = rgb_raw
 
@@ -140,10 +127,8 @@ class Monst3RAnno:
             video_path = f"./data/raw/static/{anno_dir.split('/')[-3]}/{anno_dir.split('/')[-2]}/images_4"
         elif 'static_2' in anno_dir:
             video_path = f"./data/raw/static/{anno_dir.split('/')[-4]}/{anno_dir.split('/')[-2]}.mp4"
-        elif 'dynamic' in anno_dir and 'dynamic_3' not in anno_dir:
-            video_path = f"./data/raw/dynamic/{anno_dir.split('/')[-4]}/{anno_dir.split('/')[-3]}.mp4"
-        elif 'dynamic_3' in anno_dir:
-            video_path = f"./data/raw/dynamic/{anno_dir.split('/')[-3]}/{anno_dir.split('/')[-2]}.mp4"
+        else:
+            video_path = f"./data/raw/dynamic/{anno_dir.split('/')[-3]}.mp4"
         return video_path
 
     @staticmethod

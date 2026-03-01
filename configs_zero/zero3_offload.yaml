@@ -1,51 +1,103 @@
-{
-    "bf16": {
-        "enabled": true
-    },
-    "optimizer": {
-        "type": "AdamW",
-        "params": {
-            "lr": "auto",
-            "weight_decay": "auto",
-            "torch_adam": true,
-            "adam_w_mode": true
-        }
-    },
-    "scheduler": {
-        "type": "WarmupDecayLR",
-        "params": {
-            "warmup_min_lr": "auto",
-            "warmup_max_lr": "auto",
-            "warmup_num_steps": "auto",
-            "total_num_steps": "auto"
-        }
-    },
-    "zero_optimization": {
-        "stage": 3,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "offload_param": {
-            "device": "cpu",
-            "pin_memory": true
-        },
-        "overlap_comm": true,
-        "contiguous_gradients": true,
-        "reduce_bucket_size": 5e8,
-        "stage3_prefetch_bucket_size": "auto",
-        "stage3_param_persistence_threshold": "auto",
-        "sub_group_size": 1e9,
-        "stage3_max_live_parameters": 1e9,
-        "stage3_max_reuse_distance": 1e9,
-        "stage3_gather_16bit_weights_on_model_save": "auto",
-        "stage3_prefetch_bucket_size": 5e8,
-        "stage3_param_persistence_threshold": 1e6
-    },
-    "gradient_accumulation_steps": 1,
-    "train_micro_batch_size_per_gpu": 1,
-    "train_batch_size": "auto",
-    "gradient_clipping": "auto",
-    "steps_per_print": 2000,
-    "wall_clock_breakdown": false
-}
+# =============================================================================
+# DeepSpeed ZeRO Stage 3 + Full CPU Offload 配置
+#
+# 在 ZeRO-3 基础上同时将优化器状态和模型参数卸载到 CPU，
+# 是显存占用最小的配置，也是通信/传输开销最大的配置。
+#
+# 各配置显存占用对比（14B bf16 模型，8 GPU，粗略估算）：
+#   ┌──────────────────────────┬────────────────────────────────────────┐
+#   │ 配置文件                 │ 单卡 GPU 显存（训练状态估算）          │
+#   ├──────────────────────────┼────────────────────────────────────────┤
+#   │ zero2.yaml               │ ~45GB（参数完整 + 梯度/优化器分片）    │
+#   │ zero2_offload.yaml       │ ~38GB（优化器卸载到 CPU）              │
+#   │ zero3.yaml               │ ~21GB（参数/梯度/优化器均分片）        │
+#   │ zero3_offload.yaml（本）  │ ~10GB（参数+优化器全部卸载到 CPU）     │
+#   └──────────────────────────┴────────────────────────────────────────┘
+#
+# 适用场景：
+#   - 消费级 GPU（24GB / 48GB 显存）运行 14B 模型
+#   - 拥有大量 CPU 内存（建议 ≥ 1TB）
+#   - 对训练速度要求不高（相比 zero3.yaml 可能慢 2-5 倍）
+#
+# 注意事项：
+#   - offload_param 会使每次前向传播前都需要 CPU→GPU 加载参数
+#   - PCIe 带宽是主要瓶颈，NVLink 对此无帮助（NVLink 是 GPU-GPU 通信）
+#   - 推荐与 stage3_param_persistence_threshold 配合：
+#     小参数常驻 GPU，只卸载大参数，可平衡速度和显存
+#
+# 关联文件：
+#   - Accelerate 配置  : configs_acc/8gpu_zero3.yaml（zero3_init_flag: true）
+#   - 无 Offload 版本  : configs_zero/zero3.yaml
+#   - Checkpoint 转换  : scripts/zero_to_fp32.py
+#
+# 注意：此文件原始 JSON 版本中存在重复 key，
+#       此 YAML 版已去重，保留语义上的最终有效值：
+#         stage3_prefetch_bucket_size        → 5e8（覆盖 "auto"）
+#         stage3_param_persistence_threshold → 1e6（覆盖 "auto"，比 zero3.yaml 更大）
+# =============================================================================
+
+bf16:
+  enabled: true
+
+optimizer:
+  type: AdamW
+  params:
+    lr: "auto"
+    weight_decay: "auto"
+    torch_adam: true
+    adam_w_mode: true
+
+scheduler:
+  type: WarmupDecayLR
+  params:
+    warmup_min_lr: "auto"
+    warmup_max_lr: "auto"
+    warmup_num_steps: "auto"
+    total_num_steps: "auto"
+
+zero_optimization:
+  stage: 3
+
+  # ── CPU Offload 配置（ZeRO-3 独有）─────────────────────────────────────────
+
+  offload_optimizer:
+    device:
+      cpu # 将 Adam 的 momentum/variance 和 fp32 参数副本卸载到 CPU
+      # ZeRO-3 下优化器对应分片参数，每卡约 1/8 份 → 约 7GB/卡 → CPU
+    pin_memory: true # 锁页内存，支持高效 DMA 传输（同 zero2_offload.yaml）
+
+  offload_param:
+    device:
+      cpu # 将模型参数分片也卸载到 CPU（ZeRO-3 独有）
+      # 前向传播每层前临时 AllGather 并加载到 GPU，用后立即释放
+      # 这是本配置相比 zero3.yaml 额外节省显存的核心来源
+    pin_memory: true # 必须启用，否则 CPU 内存频繁 page fault 会严重拖慢速度
+
+  overlap_comm: true
+  contiguous_gradients: true
+  reduce_bucket_size: 5.0e+8
+
+  # 参数预取桶大小（与 zero3.yaml 含义相同）
+  stage3_prefetch_bucket_size: 5.0e+8
+
+  # 参数常驻阈值：
+  #   此处设为 1e6（1M 参数），比 zero3.yaml 的 1e5 更大
+  #   更多小参数常驻 GPU，减少 CPU offload 的 PCIe 传输频率，改善速度
+  #   如显存仍然不足，可适当减小此值
+  stage3_param_persistence_threshold: 1.0e+6
+
+  sub_group_size: 1.0e+9
+
+  # offload_param 模式下，建议适当降低以减少显存中的参数驻留时间
+  stage3_max_live_parameters: 1.0e+9
+
+  stage3_max_reuse_distance: 1.0e+9
+
+  stage3_gather_16bit_weights_on_model_save: "auto"
+
+gradient_accumulation_steps: 1
+train_micro_batch_size_per_gpu: 1
+train_batch_size: "auto"
+gradient_clipping: "auto"
+steps_per_print: 2000
+wall_clock_breakdown: false
