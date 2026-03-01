@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -350,7 +351,19 @@ class Trainer:
         logger.info("Initializing trackers")
 
         tracker_name = self.args.tracker_name or "finetrainers-experiment"
-        self.accelerator.init_trackers(tracker_name, config=self.args.model_dump())
+        # Filter config to only include types supported by tensorboard hparams
+        raw_config = self.args.model_dump()
+        config = {}
+        for k, v in raw_config.items():
+            if isinstance(v, (int, float, str, bool)):
+                config[k] = v
+            elif isinstance(v, Path):
+                config[k] = str(v)
+            elif isinstance(v, (list, tuple)):
+                config[k] = str(v)
+            elif v is None:
+                config[k] = "None"
+        self.accelerator.init_trackers(tracker_name, config=config)
 
     def train(self) -> None:
         logger.info("Starting training")
@@ -716,6 +729,18 @@ class Trainer:
                     output_dir,
                     transformer_lora_layers=transformer_lora_layers_to_save,
                 )
+
+                # Save extra trainable parameters (e.g. learnable_domain_embeddings)
+                model = unwrap_model(self.accelerator, self.components.transformer)
+                extra_state = {
+                    k: v for k, v in model.state_dict().items()
+                    if 'learnable_domain_embeddings' in k
+                }
+                if extra_state:
+                    torch.save(
+                        extra_state,
+                        os.path.join(output_dir, "learnable_domain_embeddings.pt"),
+                    )
 
         def load_model_hook(models, input_dir):
             if not self.accelerator.distributed_type == DistributedType.DEEPSPEED:

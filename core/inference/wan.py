@@ -64,9 +64,20 @@ def generate_video(
             from core.finetune.models.wan_i2v.demb_samerope_trainer import WanTransformer3DModelDembSameRope
             transformer = WanTransformer3DModelDembSameRope.from_pretrained(sft_path, torch_dtype=dtype)
             assert lora_path is not None, "Lora path is required for i2vwbw-demb-samerope"
-            learnable_domain_embeddings = torch.load(os.path.join(lora_path, "learnable_domain_embeddings.pt"))
-            transformer.learnable_domain_embeddings.data = learnable_domain_embeddings.to(transformer.device, transformer.dtype)
-            print(f"Loaded learnable_domain_embeddings from {lora_path}")
+            demb_path = os.path.join(lora_path, "learnable_domain_embeddings.pt")
+            if os.path.exists(demb_path):
+                demb_state = torch.load(demb_path, weights_only=True)
+                if isinstance(demb_state, dict):
+                    # Saved as state_dict: {"learnable_domain_embeddings": tensor}
+                    for k, v in demb_state.items():
+                        if 'learnable_domain_embeddings' in k:
+                            transformer.learnable_domain_embeddings.data = v.to(transformer.device, transformer.dtype)
+                else:
+                    # Saved as raw tensor
+                    transformer.learnable_domain_embeddings.data = demb_state.to(transformer.device, transformer.dtype)
+                print(f"Loaded learnable_domain_embeddings from {lora_path}")
+            else:
+                print(f"Warning: {demb_path} not found, using default learnable_domain_embeddings")
         else:
             from diffusers import WanTransformer3DModel
             config_path = os.path.join(sft_path, 'config.json')
