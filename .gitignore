@@ -1,3 +1,9 @@
+.DS_Store
+vis_out/
+refer
+videos/
+raw_data/
+
 __pycache__/
 build/
 *.egg-info/

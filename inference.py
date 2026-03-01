@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 import numpy as np
 import imageio
