@@ -8,6 +8,7 @@ bak/
 .env
 logs/
 training/
+*.rrd
 
 __pycache__/
 build/
