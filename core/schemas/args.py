@@ -11,8 +11,7 @@ class Args(BaseModel):
     model_path: Path
     training_type: Literal["lora", "sft"] = "lora"
 
-    ########## Output ##########
-    output_dir: Path = Path("train_results/{:%Y-%m-%d-%H-%M-%S}".format(datetime.datetime.now()))
+    output_dir: Path | None = None
     report_to: Literal["tensorboard", "swanlab", "all"] | None = None
     tracker_name: str = "finetrainer"
     experiment_name: str | None = None
@@ -110,7 +109,7 @@ class Args(BaseModel):
         # Model & output
         p.add_argument("--model_path", type=str, required=True)
         p.add_argument("--training_type", type=str, default="lora", choices=["lora", "sft"])
-        p.add_argument("--output_dir", type=str, required=True)
+        p.add_argument("--output_dir", type=str, default=None)
         p.add_argument("--report_to", type=str, required=True)
         p.add_argument("--tracker_name", type=str, default="finetrainer")
         p.add_argument("--experiment_name", type=str, default=None)
@@ -174,5 +173,9 @@ class Args(BaseModel):
         # Convert train_resolution string "81x480x720" to tuple
         frames, height, width = args.train_resolution.split("x")
         args.train_resolution = (int(frames), int(height), int(width))
+
+        if args.output_dir is None:
+            exp_name = args.experiment_name if args.experiment_name else "default"
+            args.output_dir = f"training/{args.tracker_name}-{exp_name}"
 
         return cls(**vars(args))
