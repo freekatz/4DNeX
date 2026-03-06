@@ -27,7 +27,7 @@ def decode_and_save(latents, tokenizer, save_path, mode='rgb', fps=24):
         mode: 'rgb' for standard decode, 'xyz' for XYZ with denormalization.
 
     Returns:
-        frames: [F, H, W, 3] numpy array in [0, 1].
+        frames: [F, H, W, 3] numpy array. RGB in [0, 1]; XYZ in original scale.
     """
     latents = latents[None]  # Add batch dim → [1, 16, F, H, W]
 
@@ -35,9 +35,12 @@ def decode_and_save(latents, tokenizer, save_path, mode='rgb', fps=24):
         # Apply dataset-specific denormalization for XYZ before VAE decode
         latents = latents * ENCODED_PM_STD + ENCODED_PM_MEAN
 
-    frames = tokenizer.decode(latents)  # [F, H, W, 3] in [0, 1]
+    frames = tokenizer.decode(latents)  # [F, H, W, 3]
     mp4_path = save_path if save_path.endswith('.mp4') else save_path.rsplit('.', 1)[0] + '.mp4'
     imageio.mimwrite(mp4_path, (frames * 255).clip(0, 255).astype(np.uint8), fps=fps)
+
+    if mode == 'rgb':
+        frames = frames.clip(0, 1)
     return frames
 
 
@@ -104,16 +107,56 @@ def load_latent_cache(cache_path):
     raise ValueError(f"Invalid latent cache format: {cache_path}")
 
 
-def main(args):
-    prompt_list = []
-    with open(args.prompt, 'r') as f:
-        for line in f.readlines():
-            prompt_list.append(line.strip())
+def load_list(path_or_value):
+    """Load a list from a file (one item per line) or treat as a single value."""
+    if os.path.isfile(path_or_value):
+        with open(path_or_value, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    return [path_or_value]
 
-    image_list = []
-    with open(args.image, 'r') as f:
-        for line in f.readlines():
-            image_list.append(line.strip())
+
+def load_from_clip_dir(clip_dir):
+    """Load prompt and image lists from a clip directory (or multiple clips).
+
+    Supports:
+        - Single clip dir: videos/{source}/{video_id}/{clip_id}/
+        - Parent dir containing multiple clip_* subdirs
+    Returns:
+        (prompt_list, image_list)
+    """
+    from pathlib import Path
+    clip_dir = Path(clip_dir)
+
+    # Collect clip directories
+    if (clip_dir / "meta.json").exists():
+        clip_dirs = [clip_dir]
+    else:
+        clip_dirs = sorted(d for d in clip_dir.iterdir() if d.is_dir() and (d / "meta.json").exists())
+        if not clip_dirs:
+            raise ValueError(f"No clip directories (with meta.json) found in {clip_dir}")
+
+    prompt_list, image_list = [], []
+    for d in clip_dirs:
+        caption_file = d / "caption.txt"
+        image_file = d / "first_frame.png"
+        if not caption_file.exists():
+            raise FileNotFoundError(f"Missing caption.txt in {d}")
+        if not image_file.exists():
+            raise FileNotFoundError(f"Missing first_frame.png in {d}")
+        prompt_list.append(caption_file.read_text(encoding="utf-8").strip())
+        image_list.append(str(image_file))
+
+    return prompt_list, image_list
+
+
+def main(args):
+    if args.clip_dir is not None:
+        prompt_list, image_list = load_from_clip_dir(args.clip_dir)
+    else:
+        if args.prompt is None or args.image is None:
+            raise ValueError("Provide --clip_dir, or both --prompt and --image")
+        prompt_list = load_list(args.prompt)
+        image_list = load_list(args.image)
 
     assert len(prompt_list) == len(image_list), \
         f"Prompt count ({len(prompt_list)}) != image count ({len(image_list)})"
@@ -262,8 +305,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate RGB + XYZ from a single image")
-    parser.add_argument("--prompt", type=str, required=True, help="Path to prompt list file")
-    parser.add_argument("--image", type=str, required=True, help="Path to image list file")
+    parser.add_argument("--prompt", type=str, default=None, help="Prompt string or path to prompt list file")
+    parser.add_argument("--image", type=str, default=None, help="Image path or path to image list file")
+    parser.add_argument("--clip_dir", type=str, default=None,
+                        help="Clip directory (reads caption.txt + first_frame.png). "
+                             "Can be a single clip or parent dir with multiple clip_* subdirs")
     parser.add_argument("--idx", type=int, default=-1, help="Process only this index (-1 for all)")
     parser.add_argument("--shard_id", type=int, default=0, help="Shard index for multi-GPU inference (0-based)")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
@@ -272,7 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--weights_path", type=str, required=True,
                         help="Path to trained weights (dir or .safetensors file)")
     parser.add_argument("--out", type=str, default="results", help="Output directory")
-    parser.add_argument("--num_frames", type=int, default=49, help="Number of frames to generate")
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
     parser.add_argument("--width", type=int, default=None, help="Output video width (must match model constraints)")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Diffusion steps")
@@ -287,13 +333,13 @@ if __name__ == "__main__":
                              "'model' = whole-model offload (~28GB), "
                              "'sequential' = per-layer offload (~8GB, slower), "
                              "'none' = all on GPU (fastest, ~30GB+)")
-    parser.add_argument("--latents_on_cpu", type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True,
+    parser.add_argument("--latents_on_cpu", action=argparse.BooleanOptionalAction, default=True,
                         help="Move generated latents to CPU before returning (recommended to avoid decode-time OOM)")
     parser.add_argument("--decode_device", type=str, default="cuda", choices=["cpu", "cuda", "auto"],
                         help="Device for VAE decode. Use cpu to reduce GPU peak memory")
-    parser.add_argument("--decode_fast", type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True,
+    parser.add_argument("--decode_fast", action=argparse.BooleanOptionalAction, default=True,
                         help="Use fastest decode mode (disable VAE slicing/tiling). May use more memory")
-    parser.add_argument("--use_latent_cache", type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True,
+    parser.add_argument("--use_latent_cache", action=argparse.BooleanOptionalAction, default=True,
                         help="If cache exists, load denoised latents directly and skip denoising")
     parser.add_argument("--latent_cache_dir", type=str, default=None,
                         help="Directory to store/load denoised latent cache (default: <out>/latent_cache)")
