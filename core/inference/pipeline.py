@@ -55,7 +55,7 @@ def generate_video(
     from safetensors.torch import load_file
 
     if target_modules is None:
-        target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
+        target_modules = ["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"]
 
     with torch.inference_mode():
         # Load image encoder
