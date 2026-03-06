@@ -12,6 +12,7 @@ import diffusers
 import torch
 import transformers
 import swanlab
+from swanlab.integration.accelerate import SwanLabTracker
 from accelerate.accelerator import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import (
@@ -98,21 +99,26 @@ class Trainer:
         )
         mixed_precision = "no" if torch.backends.mps.is_available() else self.args.mixed_precision
         report_to_arg = (self.args.report_to or "none").lower()
-        log_with = None
-        if report_to_arg != "none":
-            if report_to_arg == "all":
-                log_with = ["tensorboard", "swanlab"]
-            else:
-                log_with = report_to_arg
+        log_with = []
+        if report_to_arg in ("tensorboard", "all"):
+            log_with.append("tensorboard")
         self._use_swanlab_tracker = report_to_arg in ("swanlab", "all")
 
         accelerator = Accelerator(
             project_config=project_config,
             gradient_accumulation_steps=self.args.gradient_accumulation_steps,
             mixed_precision=mixed_precision,
-            log_with=log_with,
+            log_with=log_with or None,
             kwargs_handlers=[ddp_kwargs, init_process_group_kwargs],
         )
+
+        # SwanLabTracker must be created after Accelerator (needs AcceleratorState).
+        if self._use_swanlab_tracker:
+            swanlab_kwargs = {}
+            if self.args.experiment_name:
+                swanlab_kwargs["experiment_name"] = self.args.experiment_name
+            swanlab_tracker = SwanLabTracker(self.args.tracker_name, **swanlab_kwargs)
+            accelerator.trackers.append(swanlab_tracker)
 
         # Disable AMP for MPS.
         if torch.backends.mps.is_available():
@@ -345,10 +351,7 @@ class Trainer:
                 config[k] = str(v)
             elif v is None:
                 config[k] = "None"
-        init_kwargs = {}
-        if self._use_swanlab_tracker and self.args.experiment_name:
-            init_kwargs["swanlab"] = {"experiment_name": self.args.experiment_name}
-        self.accelerator.init_trackers(tracker_name, config=config, init_kwargs=init_kwargs)
+        self.accelerator.init_trackers(tracker_name, config=config)
 
         # Save run metadata (config snapshot + README)
         if self.accelerator.is_main_process:
