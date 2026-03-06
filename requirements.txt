@@ -1,6 +1,6 @@
-diffusers==0.34.0
-transformers==4.49.0
-accelerate==1.5.2
+diffusers
+transformers
+accelerate
 sentencepiece
 peft
 swanlab
