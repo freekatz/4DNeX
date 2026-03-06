@@ -125,6 +125,9 @@ def generate_video(
             torch_dtype=dtype,
         )
         pipe.transformer.eval()
+        if torch.cuda.is_available():
+            logger.info("Compiling transformer with torch.compile for faster inference...")
+            pipe.transformer = torch.compile(pipe.transformer)
         pipe.text_encoder.eval()
         pipe.image_encoder.eval()
         pipe.vae.eval()

@@ -51,19 +51,22 @@ def retrieve_latents(
 # =============================================================================
 
 class ZeroInitControlLink(nn.Module):
-    """Zero-initialized linear layer for cross-modal control.
+    """Zero-initialized bottleneck layer for cross-modal control.
 
     Applied at the output level to enable interaction between RGB and XYZ branches.
-    Initialized to zero so training starts with independence; links gradually learn alignment.
+    Uses LayerNorm and a bottleneck structure for stability and parameter efficiency,
+    and initializes the final projection to zero so training starts with independence.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, rank: int = 256):
         super().__init__()
-        self.linear = nn.Linear(dim, dim, bias=False)
-        nn.init.zeros_(self.linear.weight)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.up = nn.Linear(rank, dim, bias=False)
+        nn.init.zeros_(self.up.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        return self.up(F.silu(self.down(self.norm(x))))
 
 
 # =============================================================================
@@ -367,8 +370,16 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
                 if param.is_meta:
                     meta_params_found = True
                     if 'dlc_' in name:
-                        # DLC should be zero-initialized
-                        value = torch.zeros(param.shape, dtype=model.dtype)
+                        # DLC should have zero-initialized up projection, others standard
+                        if 'up.weight' in name:
+                            value = torch.zeros(param.shape, dtype=model.dtype)
+                        elif 'norm.weight' in name:
+                            value = torch.ones(param.shape, dtype=model.dtype)
+                        elif 'norm.bias' in name:
+                            value = torch.zeros(param.shape, dtype=model.dtype)
+                        else:
+                            value = torch.empty(param.shape, dtype=model.dtype)
+                            nn.init.kaiming_uniform_(value, a=math.sqrt(5))
                     elif 'patch_embedding_xyz' in name and 'weight' in name:
                         # Initialize from base patch_embedding (first 16 channels)
                         base_pe = model.patch_embedding.weight
