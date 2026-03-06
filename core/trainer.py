@@ -114,7 +114,7 @@ class Trainer:
 
         # SwanLabTracker must be created after Accelerator (needs AcceleratorState).
         if self._use_swanlab_tracker:
-            swanlab_kwargs = {}
+            swanlab_kwargs = {"logdir": str(self.args.output_dir / "logs" / "swanlab")}
             if self.args.experiment_name:
                 swanlab_kwargs["experiment_name"] = self.args.experiment_name
             swanlab_tracker = SwanLabTracker(self.args.tracker_name, **swanlab_kwargs)
