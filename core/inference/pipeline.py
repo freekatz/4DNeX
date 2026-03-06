@@ -106,14 +106,14 @@ def generate_video(
             set_peft_model_state_dict(transformer, xyz_state, adapter_name="xyz")
             logger.info(f"Loaded {len(xyz_state)} XYZ LoRA weights")
 
-        # Load ZCL + patch_embedding_xyz
+        # Load DLC + patch_embedding_xyz
         extra_state = {
             k: v for k, v in combined.items()
             if not k.startswith("rgb.") and not k.startswith("xyz.")
         }
         if extra_state:
             transformer.load_state_dict(extra_state, strict=False)
-            logger.info(f"Loaded {len(extra_state)} extra weights (ZCL + patch_embedding_xyz)")
+            logger.info(f"Loaded {len(extra_state)} extra weights (DLC + patch_embedding_xyz)")
 
         del combined
 

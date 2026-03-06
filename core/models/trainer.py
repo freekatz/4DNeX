@@ -129,10 +129,11 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
     Adds:
     - patch_embedding_xyz: separate patch embedding for XYZ branch (16 channels)
     - WanRotaryPosEmb: single-modality RoPE (no width doubling)
-    - ZCL: zero-initialized control links at output level
+    - DLC: Deep Layer Control — bidirectional zero-init control links at 5 DiT layers
     - Two PEFT LoRA adapters ("rgb" and "xyz") added by trainer
 
-    Forward does two full passes through base model blocks (one per adapter).
+    Forward processes both branches interleaved block-by-block, with DLC
+    cross-modal exchange at designated layers.
     """
 
     _supports_gradient_checkpointing = True
@@ -140,6 +141,9 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
     _no_split_modules = ["WanTransformerBlock"]
     _keep_in_fp32_modules = ["time_embedder", "scale_shift_table", "norm1", "norm2", "norm3"]
     _keys_to_ignore_on_load_unexpected = ["norm_added_q"]
+
+    # 5 evenly-spaced DLC layers for 40-block model (0-indexed: 7, 15, 23, 31, 39)
+    DLC_LAYER_INDICES = (7, 15, 23, 31, 39)
 
     @register_to_config
     def __init__(
@@ -191,21 +195,15 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
         # Override base model's RoPE with single-modality version
         self.rope = WanRotaryPosEmb(attention_head_dim, patch_size, rope_max_seq_len)
 
-        # Output-level ZCL (2 modules, bidirectional)
-        self.zcl_rgb_from_xyz = ZeroInitControlLink(inner_dim)
-        self.zcl_xyz_from_rgb = ZeroInitControlLink(inner_dim)
-
-    def _run_blocks(self, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb):
-        """Run all transformer blocks on hidden_states."""
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb,
-                )
-        else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-        return hidden_states
+        # DLC: Deep Layer Control — bidirectional zero-init links at 5 DiT layers
+        self.dlc_rgb_from_xyz = nn.ModuleList([
+            ZeroInitControlLink(inner_dim) for _ in self.DLC_LAYER_INDICES
+        ])
+        self.dlc_xyz_from_rgb = nn.ModuleList([
+            ZeroInitControlLink(inner_dim) for _ in self.DLC_LAYER_INDICES
+        ])
+        # Build a lookup: block_index -> dlc_list_index (for fast access in forward)
+        self._dlc_block_to_idx = {layer_idx: i for i, layer_idx in enumerate(self.DLC_LAYER_INDICES)}
 
     def _output_proj(
         self, hidden_states, temb,
@@ -230,6 +228,16 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
         return output
 
+    def _run_block_rgb(self, block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb):
+        """Run a single block with the RGB adapter active. Used for gradient checkpointing."""
+        self.set_adapter("rgb")
+        return block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+
+    def _run_block_xyz(self, block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb):
+        """Run a single block with the XYZ adapter active. Used for gradient checkpointing."""
+        self.set_adapter("xyz")
+        return block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+
     def forward(
         self,
         hidden_states_rgb: torch.Tensor,
@@ -241,14 +249,11 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Dual-branch forward with two processing modes:
+        Dual-branch forward with interleaved block processing and DLC exchange.
 
-        Training (grad enabled): Two full forward passes (one per adapter).
-            Gradient checkpointing requires consistent adapter state within each pass.
-
-        Inference (no grad): Sequential per-block processing.
-            Runs RGB block → XYZ block for each layer, sharing frozen base weights.
-            Saves memory by not keeping two full sets of intermediate activations.
+        Both branches are processed block-by-block. At designated DLC layers
+        (indices 7, 15, 23, 31, 39), bidirectional zero-init control links
+        exchange information between RGB and XYZ branches.
 
         Args:
             hidden_states_rgb: [B, 36, F, H, W] - noisy RGB latent + condition
@@ -277,49 +282,67 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
         if enc_hs_img is not None:
             enc_hs = torch.concat([enc_hs_img, enc_hs], dim=1)
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            # Training mode: two full forward passes for gradient checkpointing safety
-            self.set_adapter("rgb")
-            h_rgb = self._run_blocks(h_rgb, enc_hs, timestep_proj, rotary_emb)
+        # 4. Interleaved block processing with DLC exchange
+        use_grad_ckpt = torch.is_grad_enabled() and self.gradient_checkpointing
+        dlc_coupling_sum_rgb = 0.0
+        dlc_coupling_sum_xyz = 0.0
+        dlc_count = 0
 
-            self.set_adapter("xyz")
-            h_xyz = self._run_blocks(h_xyz, enc_hs, timestep_proj, rotary_emb)
-        else:
-            # Inference mode: per-block interleaved processing (memory efficient)
-            for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
+            # Process RGB branch
+            if use_grad_ckpt:
+                h_rgb = self._gradient_checkpointing_func(
+                    self._run_block_rgb, block, h_rgb, enc_hs, timestep_proj, rotary_emb,
+                )
+            else:
                 self.set_adapter("rgb")
                 h_rgb = block(h_rgb, enc_hs, timestep_proj, rotary_emb)
+
+            # Process XYZ branch
+            if use_grad_ckpt:
+                h_xyz = self._gradient_checkpointing_func(
+                    self._run_block_xyz, block, h_xyz, enc_hs, timestep_proj, rotary_emb,
+                )
+            else:
                 self.set_adapter("xyz")
                 h_xyz = block(h_xyz, enc_hs, timestep_proj, rotary_emb)
 
-        # 6. Output-level ZCL (bidirectional, on hidden_states before unpatchify)
-        zcl_delta_rgb = self.zcl_rgb_from_xyz(h_xyz)
-        zcl_delta_xyz = self.zcl_xyz_from_rgb(h_rgb)
-        h_rgb_linked = h_rgb + zcl_delta_rgb
-        h_xyz_linked = h_xyz + zcl_delta_xyz
+            # DLC exchange at designated layers
+            if block_idx in self._dlc_block_to_idx:
+                dlc_idx = self._dlc_block_to_idx[block_idx]
+                dlc_delta_rgb = self.dlc_rgb_from_xyz[dlc_idx](h_xyz)
+                dlc_delta_xyz = self.dlc_xyz_from_rgb[dlc_idx](h_rgb)
+                h_rgb = h_rgb + dlc_delta_rgb
+                h_xyz = h_xyz + dlc_delta_xyz
 
-        # Store lightweight coupling metrics for the trainer logger.
-        with torch.no_grad():
-            eps = 1e-8
-            base_rgb = h_rgb.detach().float().norm(dim=-1).mean()
-            base_xyz = h_xyz.detach().float().norm(dim=-1).mean()
-            delta_rgb = zcl_delta_rgb.detach().float().norm(dim=-1).mean()
-            delta_xyz = zcl_delta_xyz.detach().float().norm(dim=-1).mean()
-            zcl_coupling_rgb = float((delta_rgb / (base_rgb + eps)).item())
-            zcl_coupling_xyz = float((delta_xyz / (base_xyz + eps)).item())
+                # Accumulate coupling metrics
+                with torch.no_grad():
+                    eps = 1e-8
+                    base_rgb = h_rgb.detach().float().norm(dim=-1).mean()
+                    base_xyz = h_xyz.detach().float().norm(dim=-1).mean()
+                    d_rgb = dlc_delta_rgb.detach().float().norm(dim=-1).mean()
+                    d_xyz = dlc_delta_xyz.detach().float().norm(dim=-1).mean()
+                    dlc_coupling_sum_rgb += float((d_rgb / (base_rgb + eps)).item())
+                    dlc_coupling_sum_xyz += float((d_xyz / (base_xyz + eps)).item())
+                    dlc_count += 1
+
+        # Store average DLC coupling metrics for the trainer logger.
+        if dlc_count > 0:
+            avg_coupling_rgb = dlc_coupling_sum_rgb / dlc_count
+            avg_coupling_xyz = dlc_coupling_sum_xyz / dlc_count
             self._last_coupling_metrics = {
-                "zcl_coupling_rgb": zcl_coupling_rgb,
-                "zcl_coupling_xyz": zcl_coupling_xyz,
-                "zcl_balance_gap": abs(zcl_coupling_rgb - zcl_coupling_xyz),
+                "dlc_coupling_rgb": avg_coupling_rgb,
+                "dlc_coupling_xyz": avg_coupling_xyz,
+                "dlc_balance_gap": abs(avg_coupling_rgb - avg_coupling_xyz),
             }
 
-        # 7. Output projection & unpatchify
+        # 5. Output projection & unpatchify
         out_rgb = self._output_proj(
-            h_rgb_linked, temb, batch_size,
+            h_rgb, temb, batch_size,
             post_patch_num_frames, post_patch_height, post_patch_width,
         )
         out_xyz = self._output_proj(
-            h_xyz_linked, temb, batch_size,
+            h_xyz, temb, batch_size,
             post_patch_num_frames, post_patch_height, post_patch_width,
         )
 
@@ -331,7 +354,7 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
 
         super().from_pretrained() uses init_empty_weights() (meta device) and only
         materializes params that exist in the checkpoint. Specific params
-        (patch_embedding_xyz, zcl_*) are not in the base checkpoint, so they remain
+        (patch_embedding_xyz, dlc_*) are not in the base checkpoint, so they remain
         on meta device. We must materialize them explicitly afterward.
         """
         try:
@@ -343,8 +366,8 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
             for name, param in list(model.named_parameters()):
                 if param.is_meta:
                     meta_params_found = True
-                    if 'zcl_' in name:
-                        # ZCL should be zero-initialized
+                    if 'dlc_' in name:
+                        # DLC should be zero-initialized
                         value = torch.zeros(param.shape, dtype=model.dtype)
                     elif 'patch_embedding_xyz' in name and 'weight' in name:
                         # Initialize from base patch_embedding (first 16 channels)
@@ -371,7 +394,7 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
                     setattr(parent, parts[-1], nn.Parameter(value))
 
             if meta_params_found:
-                logger.info("Materialized specific meta tensors (patch_embedding_xyz, zcl_*)")
+                logger.info("Materialized specific meta tensors (patch_embedding_xyz, dlc_*)")
 
             logger.info("Loaded checkpoint directly.")
             return model
@@ -540,8 +563,8 @@ class WanDualTrainer(Trainer):
 
     @override
     def prepare_trainable_parameters(self):
-        """Use PEFT LoRA with two named adapters (rgb, xyz) + ZCL + patch_embedding_xyz."""
-        logger.info("Initializing trainable parameters (PEFT dual LoRA + ZCL)")
+        """Use PEFT LoRA with two named adapters (rgb, xyz) + DLC + patch_embedding_xyz."""
+        logger.info("Initializing trainable parameters (PEFT dual LoRA + DLC)")
 
         weight_dtype = self.state.weight_dtype
 
@@ -563,9 +586,9 @@ class WanDualTrainer(Trainer):
         self.components.transformer.set_adapter(["rgb", "xyz"])
         logger.info(f"Added PEFT LoRA adapters 'rgb' and 'xyz' (rank={self.args.rank})")
 
-        # Unfreeze ZCL + patch_embedding_xyz
+        # Unfreeze DLC + patch_embedding_xyz
         for name, param in self.components.transformer.named_parameters():
-            if 'zcl_' in name or 'patch_embedding_xyz' in name:
+            if 'dlc_' in name or 'patch_embedding_xyz' in name:
                 param.requires_grad_(True)
 
         # Log trainable parameter count
@@ -594,7 +617,7 @@ class WanDualTrainer(Trainer):
         self._register_hooks(lora_config)
 
     def _register_hooks(self, lora_config):
-        """Register custom save/load hooks (PEFT LoRA + ZCL + patch_embedding_xyz)."""
+        """Register custom save/load hooks (PEFT LoRA + DLC + patch_embedding_xyz)."""
 
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
@@ -609,10 +632,10 @@ class WanDualTrainer(Trainer):
                         xyz_state = get_peft_model_state_dict(unwrapped, adapter_name="xyz")
                         xyz_state_prefixed = {f"xyz.{k}": v for k, v in xyz_state.items()}
 
-                        # Save ZCL + patch_embedding_xyz
+                        # Save DLC + patch_embedding_xyz
                         extra_state = {
                             k: v for k, v in unwrapped.state_dict().items()
-                            if 'zcl_' in k or 'patch_embedding_xyz' in k
+                            if 'dlc_' in k or 'patch_embedding_xyz' in k
                         }
 
                         # Combine all into one file
@@ -648,7 +671,7 @@ class WanDualTrainer(Trainer):
                         if xyz_state:
                             set_peft_model_state_dict(unwrapped, xyz_state, adapter_name="xyz")
 
-                        # Load ZCL + patch_embedding_xyz
+                        # Load DLC + patch_embedding_xyz
                         extra_state = {
                             k: v for k, v in combined.items()
                             if not k.startswith("rgb.") and not k.startswith("xyz.")

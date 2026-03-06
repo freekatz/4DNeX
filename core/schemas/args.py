@@ -15,6 +15,7 @@ class Args(BaseModel):
     output_dir: Path = Path("train_results/{:%Y-%m-%d-%H-%M-%S}".format(datetime.datetime.now()))
     report_to: Literal["tensorboard", "swanlab", "all"] | None = None
     tracker_name: str = "finetrainer"
+    experiment_name: str | None = None
 
     ########## Data ###########
     data_root: Path
@@ -59,9 +60,9 @@ class Args(BaseModel):
     nccl_timeout: int = 1800
 
     ########## LoRA ##########
-    rank: int = 128
-    lora_alpha: int = 64
-    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0"]
+    rank: int = 64
+    lora_alpha: int = 32
+    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"]
 
     ########## Validation ##########
     do_validation: bool = False
@@ -112,6 +113,7 @@ class Args(BaseModel):
         p.add_argument("--output_dir", type=str, required=True)
         p.add_argument("--report_to", type=str, required=True)
         p.add_argument("--tracker_name", type=str, default="finetrainer")
+        p.add_argument("--experiment_name", type=str, default=None)
 
         # Data
         p.add_argument("--data_root", type=str, required=True)
@@ -149,9 +151,9 @@ class Args(BaseModel):
         p.add_argument("--nccl_timeout", type=int, default=1800)
 
         # LoRA
-        p.add_argument("--rank", type=int, default=128)
-        p.add_argument("--lora_alpha", type=int, default=64)
-        p.add_argument("--target_modules", type=str, nargs="+", default=["to_q", "to_k", "to_v", "to_out.0"])
+        p.add_argument("--rank", type=int, default=64)
+        p.add_argument("--lora_alpha", type=int, default=32)
+        p.add_argument("--target_modules", type=str, nargs="+", default=["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"])
 
         # Checkpointing
         p.add_argument("--checkpointing_steps", type=int, default=200)

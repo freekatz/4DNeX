@@ -99,10 +99,12 @@ class Trainer:
         mixed_precision = "no" if torch.backends.mps.is_available() else self.args.mixed_precision
         report_to_arg = (self.args.report_to or "none").lower()
         log_with = None
-        if report_to_arg in ("tensorboard", "all"):
-            log_with = "tensorboard"
-        if report_to_arg in ("swanlab", "all"):
-            self._use_swanlab_tracker = True
+        if report_to_arg != "none":
+            if report_to_arg == "all":
+                log_with = ["tensorboard", "swanlab"]
+            else:
+                log_with = report_to_arg
+        self._use_swanlab_tracker = report_to_arg in ("swanlab", "all")
 
         accelerator = Accelerator(
             project_config=project_config,
@@ -343,17 +345,10 @@ class Trainer:
                 config[k] = str(v)
             elif v is None:
                 config[k] = "None"
-        self.accelerator.init_trackers(tracker_name, config=config)
-
-        # SwanLab: direct init (bypasses Accelerate tracker dispatch for reliability)
-        if self._use_swanlab_tracker and self.accelerator.is_main_process:
-            swanlab_logdir = str(self.args.output_dir / "logs" / "swanlab")
-            self._swanlab_run = swanlab.init(
-                project=tracker_name,
-                config=config,
-                logdir=swanlab_logdir,
-            )
-            logger.info(f"SwanLab initialized: project={tracker_name}, logdir={swanlab_logdir}")
+        init_kwargs = {}
+        if self._use_swanlab_tracker and self.args.experiment_name:
+            init_kwargs["swanlab"] = {"experiment_name": self.args.experiment_name}
+        self.accelerator.init_trackers(tracker_name, config=config, init_kwargs=init_kwargs)
 
         # Save run metadata (config snapshot + README)
         if self.accelerator.is_main_process:
@@ -387,7 +382,7 @@ class Trainer:
             f"  README.md            # This file\n"
             f"  checkpoints/         # Model checkpoints (step-NNNNNN/)\n"
             f"    step-NNNNNN/\n"
-            f"      weights.safetensors  # LoRA + ZCL + patch_embedding_xyz\n"
+            f"      weights.safetensors  # LoRA + DLC + patch_embedding_xyz\n"
             f"      optimizer.bin        # Optimizer state\n"
             f"      scheduler.bin        # LR scheduler state\n"
             f"      random_states_*.pkl  # RNG states for reproducibility\n"
@@ -560,7 +555,7 @@ class Trainer:
                 if "grad_norm" in logs:
                     logs["optim/grad_norm"] = float(logs["grad_norm"])
 
-                for key in ["optim/grad_norm_rgb_lora", "optim/grad_norm_xyz_lora", "optim/grad_norm_zcl"]:
+                for key in ["optim/grad_norm_rgb_lora", "optim/grad_norm_xyz_lora", "optim/grad_norm_dlc"]:
                     if key in logs:
                         logs[key] = float(logs[key])
 
@@ -572,9 +567,9 @@ class Trainer:
                         "loss_ratio_xyz",
                         "loss_gap_abs",
                         "loss_gap_rel",
-                        "zcl_coupling_rgb",
-                        "zcl_coupling_xyz",
-                        "zcl_balance_gap",
+                        "dlc_coupling_rgb",
+                        "dlc_coupling_xyz",
+                        "dlc_balance_gap",
                     ]
                     for metric_key in one4d_metric_keys:
                         if metric_key in self.state.latest_loss_metrics:
@@ -640,10 +635,10 @@ class Trainer:
                         f"loss={loss_scalar:.4f} ema={ema_loss:.4f} | "
                         f"rgb={_r('train/loss_rgb'):.4f} xyz={_r('train/loss_xyz'):.4f} "
                         f"ratio={_r('train/loss_ratio_rgb'):.2f}/{_r('train/loss_ratio_xyz'):.2f} gap={_gap_pct} | "
-                        f"zcl={_r('train/zcl_coupling_rgb'):.3f}/{_r('train/zcl_coupling_xyz'):.3f} | "
+                        f"dlc={_r('train/dlc_coupling_rgb'):.3f}/{_r('train/dlc_coupling_xyz'):.3f} | "
                         f"lr={logs.get('lr', 0):.1e} "
                         f"grad={_r('optim/grad_norm'):.2f} "
-                        f"(rgb={_r('optim/grad_norm_rgb_lora'):.2f} xyz={_r('optim/grad_norm_xyz_lora'):.2f} zcl={_r('optim/grad_norm_zcl'):.3f}) | "
+                        f"(rgb={_r('optim/grad_norm_rgb_lora'):.2f} xyz={_r('optim/grad_norm_xyz_lora'):.2f} dlc={_r('optim/grad_norm_dlc'):.3f}) | "
                         f"{step_time_sec:.1f}s/it{_mem}"
                     )
                     logger.info(console_line)
@@ -661,10 +656,6 @@ class Trainer:
                 tracker_logs = {k: v for k, v in logs.items() if "/" in k and isinstance(v, (int, float))}
                 accelerator.log(tracker_logs, step=global_step)
 
-                # SwanLab: direct log (bypasses Accelerate dispatch)
-                if self._use_swanlab_tracker and accelerator.is_main_process and hasattr(self, '_swanlab_run'):
-                    self._swanlab_run.log(tracker_logs, step=global_step)
-
                 if global_step >= self.args.train_steps:
                     break
 
@@ -681,11 +672,6 @@ class Trainer:
         free_memory()
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory after training end: {json.dumps(memory_statistics, indent=4)}")
-
-        # Finish SwanLab run before ending training
-        if self._use_swanlab_tracker and hasattr(self, '_swanlab_run'):
-            self._swanlab_run.finish()
-            logger.info("SwanLab run finished")
 
         accelerator.end_training()
 
@@ -804,15 +790,18 @@ class Trainer:
 
         all_artifacts = gather_object(all_processes_artifacts)
 
-        if accelerator.is_main_process and self._use_swanlab_tracker and hasattr(self, '_swanlab_run'):
-            tracker_key = "validation"
-            image_artifacts = [a for a in all_artifacts if isinstance(a, swanlab.Image)]
-            video_artifacts = [a for a in all_artifacts if isinstance(a, swanlab.Video)]
-            if image_artifacts or video_artifacts:
-                self._swanlab_run.log(
-                    {tracker_key: {"images": image_artifacts, "videos": video_artifacts}},
-                    step=step,
-                )
+        if accelerator.is_main_process:
+            for tracker in accelerator.trackers:
+                if tracker.name == "swanlab":
+                    tracker_key = "validation"
+                    image_artifacts = [a for a in all_artifacts if isinstance(a, swanlab.Image)]
+                    video_artifacts = [a for a in all_artifacts if isinstance(a, swanlab.Video)]
+                    if image_artifacts or video_artifacts:
+                        tracker.log(
+                            {tracker_key: {"images": image_artifacts, "videos": video_artifacts}},
+                            step=step,
+                        )
+                    break
 
         ##########  Clean up  ##########
         if self.state.using_deepspeed:
@@ -892,7 +881,7 @@ class Trainer:
         Groups:
         - RGB LoRA adapter params
         - XYZ LoRA adapter params
-        - ZCL params
+        - DLC params
         """
         try:
             model = unwrap_model(self.accelerator, self.components.transformer)
@@ -902,7 +891,7 @@ class Trainer:
         group_sum_sq = {
             "rgb_lora": 0.0,
             "xyz_lora": 0.0,
-            "zcl": 0.0,
+            "dlc": 0.0,
         }
 
         for name, param in model.named_parameters():
@@ -911,8 +900,8 @@ class Trainer:
             name_lower = name.lower()
             grad_sq = float(torch.sum(param.grad.detach().float() ** 2).item())
 
-            if "zcl_" in name_lower:
-                group_sum_sq["zcl"] += grad_sq
+            if "dlc_" in name_lower:
+                group_sum_sq["dlc"] += grad_sq
                 continue
 
             if "lora" not in name_lower:
@@ -937,7 +926,7 @@ class Trainer:
         except Exception:
             return {}
 
-        group_sum_sq = {"rgb_lora": 0.0, "xyz_lora": 0.0, "zcl": 0.0}
+        group_sum_sq = {"rgb_lora": 0.0, "xyz_lora": 0.0, "dlc": 0.0}
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -945,8 +934,8 @@ class Trainer:
             name_lower = name.lower()
             w_sq = float(torch.sum(param.detach().float() ** 2).item())
 
-            if "zcl_" in name_lower:
-                group_sum_sq["zcl"] += w_sq
+            if "dlc_" in name_lower:
+                group_sum_sq["dlc"] += w_sq
             elif "lora" in name_lower:
                 if "rgb" in name_lower:
                     group_sum_sq["rgb_lora"] += w_sq

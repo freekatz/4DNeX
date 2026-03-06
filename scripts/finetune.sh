@@ -116,6 +116,8 @@ accelerate launch \
     --model_path ./pretrained/Wan2.1-I2V-14B-480P-Diffusers \
     --output_dir "$OUTPUT_DIR" \
     --report_to all \
+    --rank 64 \
+    --lora_alpha 32 \
     --data_root ./data \
     --train_resolution 81x480x720 \
     --train_epochs 10 \
