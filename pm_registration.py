@@ -4,12 +4,8 @@ import torch.nn.functional as F
 
 import glob
 import pickle
-from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
-import imageio
-from core.dataset import PointmapDataset
-from core.annotation import Monst3RAnno
 import tyro
 
 # --------------------------------------------------------------------------- #
@@ -153,95 +149,53 @@ def depth_to_3d_points(depth_map: torch.Tensor, K: torch.Tensor, R: torch.Tensor
 
 
 def main(
-    downsample_factor: int = 1,
-    frame_gap: int = 1,
-    max_frames: int = 100,
-    use_mask: bool = False,
     pkl_dir: str = None,
-    monst3r_dir: str = None,
-    pointmap_mp4: str = None,
-    rgb_mp4: str = None,
-    pointmap_npy: str = None,
+    max_frames: int = 100,
+    frame_gap: int = 1,
 ) -> None:
-    # Data loading logic (same as vis.py, with new mp4 support)
-    if pointmap_npy is not None and rgb_mp4 is not None:
-        pointmap = np.load(pointmap_npy)  # [num_frames, H, W, 3]
-        rgb_reader = imageio.get_reader(rgb_mp4, "ffmpeg")
-        num_frames = min(pointmap.shape[0], len(rgb_reader), max_frames)
-        def PointmapIterator():
-            for i in range(num_frames):
-                pm = pointmap[i]  # H, W, 3
-                rgb = rgb_reader.get_data(i).astype(np.float32) / 255.0  # H, W, 3
-                H, W, _ = pm.shape
-                yield type('Frame', (), {
-                    'pcd': pm.reshape(-1, 3),
-                    'pcd_color': rgb.reshape(-1, 3),
-                    'rgb': rgb,
-                    'T_world_camera': np.eye(4),
-                }), f"npy_frame"
-    elif pointmap_mp4 is not None and rgb_mp4 is not None:
-        pointmap_reader = imageio.get_reader(pointmap_mp4, "ffmpeg")
-        rgb_reader = imageio.get_reader(rgb_mp4, "ffmpeg")
-        num_frames = 81
-        def PointmapIterator():
-            for i in range(num_frames):
-                pm = pointmap_reader.get_data(i).astype(np.float32) / 255.0  # H, W, 3
-                rgb = rgb_reader.get_data(i).astype(np.float32) / 255.0  # H, W, 3
-                H, W, _ = pm.shape
-                # Flatten for rerun
-                yield type('Frame', (), {
-                    'pcd': pm.reshape(-1, 3),
-                    'pcd_color': rgb.reshape(-1, 3),
-                    'rgb': rgb,
-                    'T_world_camera': np.eye(4),  # Identity if unknown
-                }), f"mp4_frame"
-    elif pkl_dir is not None:
-        pkl_list = glob.glob(f'{pkl_dir}/*.pkl')
-        def PointmapIterator():
-            for pkl_path in sorted(pkl_list):
-                yield pickle.load(open(pkl_path, 'rb')), pkl_path
-    elif monst3r_dir is not None:
-        monst3r_list = glob.glob(f'{monst3r_dir}/*/')
-        def PointmapIterator():
-            for scene_path in monst3r_list:
-                yield Monst3RAnno(scene_path, max_frames=max_frames).pointmap, scene_path
-    else:
-        raise NotImplementedError("No data source provided")
+    """Optimize camera parameters for Pointmap pkl files."""
+    if pkl_dir is None:
+        raise ValueError("--pkl_dir is required")
 
-    pointmap_iterator = PointmapIterator()
-    if rgb_mp4 is not None:
-        raise NotImplementedError("RGB MP4 is not supported yet")
-    else:
-        for (loader, name) in pointmap_iterator:
-            num_frames = min(max_frames, loader.num_frames())
-            # Before logging, I want to optimize the pointmap using the function optimise_depth_and_camera
-            # First read all pointmap from the pointmap_iterator
-            pointmap_list = []
-            for i in range(num_frames):
-                frame = loader.get_frame(i)
-                H, W, _ = frame.rgb.shape
-                pointmap_list.append(frame.pcd.reshape(H, W, 3))
-            pointmap_list = np.stack(pointmap_list, axis=0)
-            # normalize xy to zero centered
-            pointmap_list[..., :2] = pointmap_list[..., :2] - 0.5
-            pointmap_list = torch.from_numpy(pointmap_list).cuda()
-            # Optimize the pointmap
-            depth_map, K, R, t = optimise_xyz_batch(pointmap_list)
-            updated_pointmap_list = []
-            for i in tqdm(range(0, num_frames, frame_gap)):
-                frame = loader.get_frame(i)
-                position, color = frame.pcd, frame.pcd_color
-                # use the new depth_map, K, R, t to unproject to get 3D pointmaps
-                current_depth_map = depth_map[i]
-                current_R = R[i]
-                current_t = t[i]
-                # Convert current depth map to 3D points
-                position = depth_to_3d_points(current_depth_map, K, current_R, current_t)
-                updated_pointmap_list.append(position)
-            updated_pointmap = np.stack(updated_pointmap_list, axis=0)
-            loader.pcd = updated_pointmap
-            save_path = name.replace('.pkl', '_reg.pkl')
-            pickle.dump(loader, open(save_path, 'wb'))
+    from core.datasets.dataclass import Pointmap
+
+    pkl_list = sorted(glob.glob(f'{pkl_dir}/*.pkl'))
+    for pkl_path in pkl_list:
+        pm = pickle.load(open(pkl_path, 'rb'))
+        num_frames = min(max_frames, pm.num_frames)
+        H, W = pm.height, pm.width
+
+        xyz = pm.xyz[:num_frames].copy()  # [N, H, W, 3]
+        xyz[..., :2] = xyz[..., :2] - 0.5
+        xyz_tensor = torch.from_numpy(xyz).cuda()
+
+        depth_map, K, R, t = optimise_xyz_batch(xyz_tensor)
+
+        # Reconstruct optimized pointmap
+        frame_indices = list(range(0, num_frames, frame_gap))
+        updated_xyz = []
+        for fi in tqdm(frame_indices):
+            pts = depth_to_3d_points(depth_map[fi], K, R[fi], t[fi])
+            updated_xyz.append(pts)
+        updated_xyz = np.stack(updated_xyz).reshape(-1, H, W, 3)
+
+        cams2world = np.eye(4)[None].repeat(len(frame_indices), axis=0)
+        for j, fi in enumerate(frame_indices):
+            cams2world[j, :3, :3] = R[fi].cpu().numpy()
+            cams2world[j, :3, 3] = t[fi].cpu().numpy()
+
+        opt_pm = Pointmap(
+            xyz=updated_xyz,
+            rgb=pm.rgb[frame_indices],
+            depth=depth_map[frame_indices].cpu().numpy(),
+            cams2world=cams2world,
+            K=K.cpu().numpy()[None].repeat(len(frame_indices), axis=0),
+        )
+
+        save_path = pkl_path.replace('.pkl', '_reg.pkl')
+        with open(save_path, 'wb') as f:
+            pickle.dump(opt_pm, f)
+        print(f"Saved: {save_path}")
 
 if __name__ == "__main__":
     tyro.cli(main)

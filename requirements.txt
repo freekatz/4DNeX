@@ -3,10 +3,13 @@ transformers==4.49.0
 accelerate==1.5.2
 sentencepiece
 peft
-wandb
+swanlab
 decord
 deepspeed
 opencv-python-headless
 imageio
 imageio-ffmpeg
 tyro
+rerun-sdk
+scipy
+pandas

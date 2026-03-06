@@ -1,35 +1,122 @@
 #!/bin/bash
+# Training Script — auto-detects GPU count, supports specifying GPU IDs.
+#
+# Usage:
+#   ./scripts/finetune.sh                           # all GPUs
+#   ./scripts/finetune.sh --gpus 0,1                # GPU 0 and 1
+#   ./scripts/finetune.sh --gpus 0                  # single GPU
+#   ./scripts/finetune.sh --gpus 0,1 --zero offload # ZeRO-2 with CPU offload
+#   ./scripts/finetune.sh --gpus 0 --zero offload   # single GPU + offload (low VRAM)
 
-# Prevent tokenizer parallelism issues
+set -euo pipefail
+
+# ---- Parse script args (before --) ----
+GPUS=""
+ZERO_MODE="auto"  # auto | offload | none
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpus)   GPUS="$2";     shift 2 ;;
+        --zero)   ZERO_MODE="$2"; shift 2 ;;
+        *)        break ;;  # remaining args passed to finetune.py
+    esac
+done
+
+# ---- Detect GPUs ----
+if [ -z "$GPUS" ]; then
+    NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 1)
+    GPUS=$(seq -s, 0 $((NUM_GPUS - 1)))
+else
+    NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l | tr -d ' ')
+fi
+
+echo "[finetune] GPUs: $GPUS ($NUM_GPUS total), ZeRO mode: $ZERO_MODE"
+
+# ---- Select DeepSpeed config ----
+if [ "$ZERO_MODE" = "auto" ]; then
+    if [ "$NUM_GPUS" -eq 1 ]; then
+        DS_CONFIG="configs/zero2_offload.json"
+    else
+        DS_CONFIG="configs/zero2.json"
+    fi
+elif [ "$ZERO_MODE" = "offload" ]; then
+    DS_CONFIG="configs/zero2_offload.json"
+elif [ "$ZERO_MODE" = "none" ]; then
+    DS_CONFIG=""
+else
+    echo "Unknown --zero mode: $ZERO_MODE (use: auto, offload, none)"
+    exit 1
+fi
+
+# ---- Generate accelerate config ----
+ACCEL_CONFIG=$(mktemp /tmp/accel_config_XXXXXX.yaml)
+trap "rm -f $ACCEL_CONFIG" EXIT
+
+if [ -n "$DS_CONFIG" ]; then
+    cat > "$ACCEL_CONFIG" <<EOF
+compute_environment: LOCAL_MACHINE
+gpu_ids: "$GPUS"
+num_processes: $NUM_GPUS
+debug: false
+deepspeed_config:
+  deepspeed_config_file: $DS_CONFIG
+  zero3_init_flag: false
+  deepspeed_multinode_launcher: standard
+distributed_type: DEEPSPEED
+downcast_bf16: "no"
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+EOF
+else
+    cat > "$ACCEL_CONFIG" <<EOF
+compute_environment: LOCAL_MACHINE
+gpu_ids: "$GPUS"
+num_processes: $NUM_GPUS
+debug: false
+distributed_type: "NO"
+downcast_bf16: "no"
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+EOF
+fi
+
+# ---- Launch ----
 export TOKENIZERS_PARALLELISM=false
 
-export MASTER_ADDR=localhost
-export MASTER_PORT=29500
-export NNODES=1
-export NUM_PROCESSES=8
+OUTPUT_DIR="./training"
+RUN_TS=$(date +"%Y%m%d_%H%M%S")
+LOG_DIR="$OUTPUT_DIR/logs"
+RUN_LOG="$LOG_DIR/finetune_${RUN_TS}.log"
+LATEST_LOG="$LOG_DIR/latest.log"
 
-export LAUNCHER="accelerate launch \
-    --config_file configs_acc/8gpu.yaml \
-    --main_process_ip $MASTER_ADDR \
-    --main_process_port $MASTER_PORT \
-    --machine_rank 0 \
-    --num_processes $NUM_PROCESSES \
-    --num_machines $NNODES \
-    "
+mkdir -p "$LOG_DIR"
 
-export PROGRAM="\
-finetune.py \
+echo "[finetune] Log file: $RUN_LOG"
+
+accelerate launch \
+    --config_file "$ACCEL_CONFIG" \
+    --num_processes "$NUM_GPUS" \
+    finetune.py \
     --model_path ./pretrained/Wan2.1-I2V-14B-480P-Diffusers \
-    --model_name wan-i2v-demb-samerope \
-    --model_type wan-i2v \
-    --training_type lora \
-    --rank 64 \
-    --lora_alpha 32 \
-    --output_dir training/4dnex \
-    --report_to tensorboard \
-    --data_root ./data/wan21 \
-    --caption_column prompts.txt \
-    --video_column videos.txt \
+    --output_dir "$OUTPUT_DIR" \
+    --report_to all \
+    --data_root ./data \
     --train_resolution 81x480x720 \
     --train_epochs 10 \
     --seed 42 \
@@ -39,19 +126,13 @@ finetune.py \
     --num_workers 8 \
     --pin_memory True \
     --nccl_timeout 1800 \
-    --checkpointing_steps 500 \
+    --checkpointing_steps 200 \
     --checkpointing_limit 2 \
-    --do_validation false  \
-    --validation_dir ./data/wan21 \
-    --validation_steps 500 \
-    --validation_prompts prompts_val.txt \
-    --validation_images images.txt \
-    --gen_fps 24 \
-"
+    --do_validation false \
+    "$@" \
+    2>&1 | tee -a "$RUN_LOG"
 
-
-export CMD="$LAUNCHER $PROGRAM"
-
-"$CMD"
+# Symlink latest log for convenience
+ln -sf "$(basename "$RUN_LOG")" "$LATEST_LOG"
 
 echo "END TIME: $(date)"

@@ -3,6 +3,11 @@ vis_out/
 refer
 videos/
 raw_data/
+tmp/
+bak/
+.env
+logs/
+training/
 
 __pycache__/
 build/

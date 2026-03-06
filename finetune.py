@@ -1,11 +1,10 @@
-from core.finetune.models.utils import get_model_cls
-from core.finetune.schemas import Args
+from core.models.trainer import WanDualTrainer
+from core.schemas import Args
 
 
 def main():
     args = Args.parse_args()
-    trainer_cls = get_model_cls(args.model_name, args.training_type)
-    trainer = trainer_cls(args)
+    trainer = WanDualTrainer(args)
     trainer.fit()
 
 
