@@ -1,11 +1,20 @@
+"""Model architecture and trainer for WanTransformer3DModelDembSameRope.
+
+Ported from the reference 4DNeX project (demb_samerope_trainer.py).
+Architecture: single-stream dual-modality (RGB + pointmap concatenated along width)
+with learnable domain embeddings, shared RoPE, and standard PEFT LoRA.
+"""
+
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import math
-import os
+import numpy as np
+from PIL import Image
 
 from diffusers import (
     AutoencoderKLWan,
@@ -14,12 +23,15 @@ from diffusers import (
     WanTransformer3DModel,
 )
 from diffusers.configuration_utils import register_to_config
-from diffusers.utils import logging
+from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.models.attention import FeedForward
+from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.normalization import FP32LayerNorm
 from diffusers.models.modeling_utils import ModelMixin
-from PIL import Image
-import numpy as np
+
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from typing_extensions import override
@@ -27,7 +39,7 @@ from typing_extensions import override
 from core.schemas import Components
 from core.trainer import Trainer
 from core.utils import unwrap_model, cast_training_params
-
+from core.datasets.utils import generate_uniform_pointmap
 
 
 logger = logging.get_logger(__name__)
@@ -47,40 +59,93 @@ def retrieve_latents(
 
 
 # =============================================================================
-# Building Blocks
+# Attention Processor
 # =============================================================================
 
-class ZeroInitControlLink(nn.Module):
-    """Zero-initialized bottleneck layer for cross-modal control.
+class WanAttnProcessor2_0:
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("WanAttnProcessor2_0 requires PyTorch 2.0.")
 
-    Applied at the output level to enable interaction between RGB and XYZ branches.
-    Uses LayerNorm and a bottleneck structure for stability and parameter efficiency,
-    and initializes the final projection to zero so training starts with independence.
-    """
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states_img = None
+        if attn.add_k_proj is not None:
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
 
-    def __init__(self, dim: int, rank: int = 256):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.down = nn.Linear(dim, rank, bias=False)
-        self.up = nn.Linear(rank, dim, bias=False)
-        nn.init.zeros_(self.up.weight)
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(F.silu(self.down(self.norm(x))))
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+        if rotary_emb is not None:
+
+            def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+                x_rotated = torch.view_as_complex(hidden_states.to(torch.float64).unflatten(3, (-1, 2)))
+                x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+                return x_out.type_as(hidden_states)
+
+            query = apply_rotary_emb(query, rotary_emb)
+            key = apply_rotary_emb(key, rotary_emb)
+
+        # I2V task
+        hidden_states_img = None
+        if encoder_hidden_states_img is not None:
+            key_img = attn.add_k_proj(encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+            value_img = attn.add_v_proj(encoder_hidden_states_img)
+
+            key_img = key_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+            value_img = value_img.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+
+            hidden_states_img = F.scaled_dot_product_attention(
+                query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
+            hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
+            hidden_states_img = hidden_states_img.type_as(query)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        if hidden_states_img is not None:
+            hidden_states = hidden_states + hidden_states_img
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
 
 
 # =============================================================================
-# RoPE (standard single-modality, no width doubling)
+# RoPE (width-halving with duplication for dual-modality)
 # =============================================================================
 
 class WanRotaryPosEmb(nn.Module):
-    """Standard RoPE for single-modality input (no width//2 doubling)."""
-
     def __init__(
-        self, attention_head_dim: int, patch_size: Tuple[int, int, int],
-        max_seq_len: int, theta: float = 10000.0
+        self, attention_head_dim: int, patch_size: Tuple[int, int, int], max_seq_len: int, theta: float = 10000.0
     ):
         super().__init__()
+
         self.attention_head_dim = attention_head_dim
         self.patch_size = patch_size
         self.max_seq_len = max_seq_len
@@ -91,18 +156,17 @@ class WanRotaryPosEmb(nn.Module):
         freqs = []
         for dim in [t_dim, h_dim, w_dim]:
             freq = get_1d_rotary_pos_embed(
-                dim, max_seq_len, theta,
-                use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float64,
+                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float64
             )
             freqs.append(freq)
         self.freqs = torch.cat(freqs, dim=1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        # Modality concat along width: halve width for positional encoding
+        width = width // 2
         p_t, p_h, p_w = self.patch_size
-        ppf = num_frames // p_t
-        pph = height // p_h
-        ppw = width // p_w
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
 
         freqs = self.freqs.to(hidden_states.device)
         freqs = freqs.split_with_sizes(
@@ -117,26 +181,110 @@ class WanRotaryPosEmb(nn.Module):
         freqs_f = freqs[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_h = freqs[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_w = freqs[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-        freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(1, 1, ppf * pph * ppw, -1)
+        # Duplicate freqs for both modality halves
+        freqs_f = torch.cat([freqs_f, freqs_f], dim=2)
+        freqs_h = torch.cat([freqs_h, freqs_h], dim=2)
+        freqs_w = torch.cat([freqs_w, freqs_w], dim=2)
+        freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(1, 1, ppf * pph * ppw * 2, -1)
         return freqs
 
 
 # =============================================================================
-# Dual-Branch Transformer Model (inherits WanTransformer3DModel, uses PEFT LoRA)
+# Transformer Block
 # =============================================================================
 
-class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
-    """Dual-branch Transformer: dual-branch processing using PEFT LoRA.
+class WanTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        qk_norm: str = "rms_norm_across_heads",
+        cross_attn_norm: bool = False,
+        eps: float = 1e-6,
+        added_kv_proj_dim: Optional[int] = None,
+    ):
+        super().__init__()
 
-    Inherits the full WanTransformer3DModel (same blocks, same forward).
-    Adds:
-    - patch_embedding_xyz: separate patch embedding for XYZ branch (16 channels)
-    - WanRotaryPosEmb: single-modality RoPE (no width doubling)
-    - DLC: Deep Layer Control — bidirectional zero-init control links at 5 DiT layers
-    - Two PEFT LoRA adapters ("rgb" and "xyz") added by trainer
+        # 1. Self-attention
+        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.attn1 = Attention(
+            query_dim=dim,
+            heads=num_heads,
+            kv_heads=num_heads,
+            dim_head=dim // num_heads,
+            qk_norm=qk_norm,
+            eps=eps,
+            bias=True,
+            cross_attention_dim=None,
+            out_bias=True,
+            processor=WanAttnProcessor2_0(),
+        )
 
-    Forward processes both branches interleaved block-by-block, with DLC
-    cross-modal exchange at designated layers.
+        # 2. Cross-attention
+        self.attn2 = Attention(
+            query_dim=dim,
+            heads=num_heads,
+            kv_heads=num_heads,
+            dim_head=dim // num_heads,
+            qk_norm=qk_norm,
+            eps=eps,
+            bias=True,
+            cross_attention_dim=None,
+            out_bias=True,
+            added_kv_proj_dim=added_kv_proj_dim,
+            added_proj_bias=True,
+            processor=WanAttnProcessor2_0(),
+        )
+        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+
+        # 3. Feed-forward
+        self.ffn = FeedForward(dim, inner_dim=ffn_dim, activation_fn="gelu-approximate")
+        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        rotary_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            self.scale_shift_table + temb.float()
+        ).chunk(6, dim=1)
+
+        # 1. Self-attention
+        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        attn_output = self.attn1(hidden_states=norm_hidden_states, rotary_emb=rotary_emb)
+        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+
+        # 2. Cross-attention
+        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        attn_output = self.attn2(hidden_states=norm_hidden_states, encoder_hidden_states=encoder_hidden_states)
+        hidden_states = hidden_states + attn_output
+
+        # 3. Feed-forward
+        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+            hidden_states
+        )
+        ff_output = self.ffn(norm_hidden_states)
+        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+
+        return hidden_states
+
+
+# =============================================================================
+# DembSameRope Transformer Model
+# =============================================================================
+
+class WanTransformer3DModelDembSameRope(WanTransformer3DModel, ModelMixin):
+    """Wan Transformer with learnable domain embeddings and shared RoPE.
+
+    Single-stream architecture: RGB and pointmap are concatenated along the width
+    dimension. Distinguished by learnable_domain_embeddings (one per modality half).
+    Uses custom WanTransformerBlock with WanAttnProcessor2_0.
     """
 
     _supports_gradient_checkpointing = True
@@ -144,9 +292,6 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
     _no_split_modules = ["WanTransformerBlock"]
     _keep_in_fp32_modules = ["time_embedder", "scale_shift_table", "norm1", "norm2", "norm3"]
     _keys_to_ignore_on_load_unexpected = ["norm_added_q"]
-
-    # 5 evenly-spaced DLC layers for 40-block model (0-indexed: 7, 15, 23, 31, 39)
-    DLC_LAYER_INDICES = (7, 15, 23, 31, 39)
 
     @register_to_config
     def __init__(
@@ -190,277 +335,139 @@ class WanDualTransformer3DModel(WanTransformer3DModel, ModelMixin):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        # XYZ branch patch embedding (16 channels, no condition)
-        self.patch_embedding_xyz = nn.Conv3d(
-            out_channels, inner_dim, kernel_size=patch_size, stride=patch_size,
-        )
-
-        # Override base model's RoPE with single-modality version
+        # Override RoPE with width-halving version
         self.rope = WanRotaryPosEmb(attention_head_dim, patch_size, rope_max_seq_len)
 
-        # DLC: Deep Layer Control — bidirectional zero-init links at 5 DiT layers
-        self.dlc_rgb_from_xyz = nn.ModuleList([
-            ZeroInitControlLink(inner_dim) for _ in self.DLC_LAYER_INDICES
-        ])
-        self.dlc_xyz_from_rgb = nn.ModuleList([
-            ZeroInitControlLink(inner_dim) for _ in self.DLC_LAYER_INDICES
-        ])
-        # Build a lookup: block_index -> dlc_list_index (for fast access in forward)
-        self._dlc_block_to_idx = {layer_idx: i for i, layer_idx in enumerate(self.DLC_LAYER_INDICES)}
-
-    def _output_proj(
-        self, hidden_states, temb,
-        batch_size, post_patch_num_frames, post_patch_height, post_patch_width,
-    ):
-        p_t, p_h, p_w = self.config.patch_size
-
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
-        shift = shift.to(hidden_states.device)
-        scale = scale.to(hidden_states.device)
-
-        hidden_states = (
-            self.norm_out(hidden_states.float()) * (1 + scale) + shift
-        ).type_as(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
-
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width,
-            p_t, p_h, p_w, -1
+        # Override blocks with custom WanTransformerBlock
+        self.blocks = nn.ModuleList(
+            [
+                WanTransformerBlock(
+                    inner_dim, ffn_dim, num_attention_heads, qk_norm, cross_attn_norm, eps, added_kv_proj_dim
+                )
+                for _ in range(num_layers)
+            ]
         )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return output
 
-    def _run_block_rgb(self, block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb):
-        """Run a single block with the RGB adapter active. Used for gradient checkpointing."""
-        self.set_adapter("rgb")
-        return block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-
-    def _run_block_xyz(self, block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb):
-        """Run a single block with the XYZ adapter active. Used for gradient checkpointing."""
-        self.set_adapter("xyz")
-        return block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+        # Learnable domain embeddings: [2, inner_dim] — one for each modality half
+        self.learnable_domain_embeddings = nn.Parameter(torch.zeros(2, inner_dim))
 
     def forward(
         self,
-        hidden_states_rgb: torch.Tensor,
-        hidden_states_xyz: torch.Tensor,
+        hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Dual-branch forward with interleaved block processing and DLC exchange.
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
 
-        Both branches are processed block-by-block. At designated DLC layers
-        (indices 7, 15, 23, 31, 39), bidirectional zero-init control links
-        exchange information between RGB and XYZ branches.
+        if USE_PEFT_BACKEND:
+            scale_lora_layers(self, lora_scale)
+        else:
+            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                )
 
-        Args:
-            hidden_states_rgb: [B, 36, F, H, W] - noisy RGB latent + condition
-            hidden_states_xyz: [B, 16, F, H, W] - noisy XYZ latent
-        Returns:
-            pred_rgb, pred_xyz: [B, 16, F, H, W] each
-        """
-        batch_size = hidden_states_xyz.shape[0]
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
-        post_patch_num_frames = hidden_states_xyz.shape[2] // p_t
-        post_patch_height = hidden_states_xyz.shape[3] // p_h
-        post_patch_width = hidden_states_xyz.shape[4] // p_w
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
 
-        # 1. RoPE (single-modality, computed from XYZ shape)
-        rotary_emb = self.rope(hidden_states_xyz)
+        rotary_emb = self.rope(hidden_states)
 
-        # 2. Patch embedding
-        h_rgb = self.patch_embedding(hidden_states_rgb).flatten(2).transpose(1, 2)  # [B, N, D]
-        h_xyz = self.patch_embedding_xyz(hidden_states_xyz).flatten(2).transpose(1, 2)  # [B, N, D]
+        hidden_states = self.patch_embedding(hidden_states)
+        # Add domain embeddings to each modality half
+        first_half_domain_emb, second_half_domain_emb = self.learnable_domain_embeddings.chunk(2, dim=0)
+        hidden_states = torch.cat([
+            hidden_states[:, :, :, :, :post_patch_width // 2] + first_half_domain_emb[..., None, None, None],
+            hidden_states[:, :, :, :, post_patch_width // 2:] + second_half_domain_emb[..., None, None, None],
+        ], dim=4)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # 3. Condition embedding (shared, computed once)
-        temb, timestep_proj, enc_hs, enc_hs_img = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image,
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+            timestep, encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, -1))
-        if enc_hs_img is not None:
-            enc_hs = torch.concat([enc_hs_img, enc_hs], dim=1)
 
-        # 4. Interleaved block processing with DLC exchange
-        use_grad_ckpt = torch.is_grad_enabled() and self.gradient_checkpointing
-        dlc_coupling_sum_rgb = 0.0
-        dlc_coupling_sum_xyz = 0.0
-        dlc_count = 0
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-        for block_idx, block in enumerate(self.blocks):
-            # Process RGB branch
-            if use_grad_ckpt:
-                h_rgb = self._gradient_checkpointing_func(
-                    self._run_block_rgb, block, h_rgb, enc_hs, timestep_proj, rotary_emb,
+        # Transformer blocks
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block in self.blocks:
+                hidden_states = self._gradient_checkpointing_func(
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
-            else:
-                self.set_adapter("rgb")
-                h_rgb = block(h_rgb, enc_hs, timestep_proj, rotary_emb)
+        else:
+            for block in self.blocks:
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
-            # Process XYZ branch
-            if use_grad_ckpt:
-                h_xyz = self._gradient_checkpointing_func(
-                    self._run_block_xyz, block, h_xyz, enc_hs, timestep_proj, rotary_emb,
-                )
-            else:
-                self.set_adapter("xyz")
-                h_xyz = block(h_xyz, enc_hs, timestep_proj, rotary_emb)
+        # Output norm, projection & unpatchify
+        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
-            # DLC exchange at designated layers
-            if block_idx in self._dlc_block_to_idx:
-                dlc_idx = self._dlc_block_to_idx[block_idx]
-                dlc_delta_rgb = self.dlc_rgb_from_xyz[dlc_idx](h_xyz)
-                dlc_delta_xyz = self.dlc_xyz_from_rgb[dlc_idx](h_rgb)
-                h_rgb = h_rgb + dlc_delta_rgb
-                h_xyz = h_xyz + dlc_delta_xyz
+        shift = shift.to(hidden_states.device)
+        scale = scale.to(hidden_states.device)
 
-                # Accumulate coupling metrics
-                with torch.no_grad():
-                    eps = 1e-8
-                    base_rgb = h_rgb.detach().float().norm(dim=-1).mean()
-                    base_xyz = h_xyz.detach().float().norm(dim=-1).mean()
-                    d_rgb = dlc_delta_rgb.detach().float().norm(dim=-1).mean()
-                    d_xyz = dlc_delta_xyz.detach().float().norm(dim=-1).mean()
-                    dlc_coupling_sum_rgb += float((d_rgb / (base_rgb + eps)).item())
-                    dlc_coupling_sum_xyz += float((d_xyz / (base_xyz + eps)).item())
-                    dlc_count += 1
+        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.proj_out(hidden_states)
 
-        # Store average DLC coupling metrics for the trainer logger.
-        if dlc_count > 0:
-            avg_coupling_rgb = dlc_coupling_sum_rgb / dlc_count
-            avg_coupling_xyz = dlc_coupling_sum_xyz / dlc_count
-            self._last_coupling_metrics = {
-                "dlc_coupling_rgb": avg_coupling_rgb,
-                "dlc_coupling_xyz": avg_coupling_xyz,
-                "dlc_balance_gap": abs(avg_coupling_rgb - avg_coupling_xyz),
-            }
-
-        # 5. Output projection & unpatchify
-        out_rgb = self._output_proj(
-            h_rgb, temb, batch_size,
-            post_patch_num_frames, post_patch_height, post_patch_width,
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
         )
-        out_xyz = self._output_proj(
-            h_xyz, temb, batch_size,
-            post_patch_num_frames, post_patch_height, post_patch_width,
-        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
-        return out_rgb, out_xyz
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """Load from WanTransformer3DModel base weights.
-
-        super().from_pretrained() uses init_empty_weights() (meta device) and only
-        materializes params that exist in the checkpoint. Specific params
-        (patch_embedding_xyz, dlc_*) are not in the base checkpoint, so they remain
-        on meta device. We must materialize them explicitly afterward.
-        """
+    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
         try:
             model = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-            # Materialize specific params that stayed on meta device
-            # (not present in base WanTransformer3DModel checkpoint)
-            meta_params_found = False
-            for name, param in list(model.named_parameters()):
-                if param.is_meta:
-                    meta_params_found = True
-                    if 'dlc_' in name:
-                        # DLC should have zero-initialized up projection, others standard
-                        if 'up.weight' in name:
-                            value = torch.zeros(param.shape, dtype=model.dtype)
-                        elif 'norm.weight' in name:
-                            value = torch.ones(param.shape, dtype=model.dtype)
-                        elif 'norm.bias' in name:
-                            value = torch.zeros(param.shape, dtype=model.dtype)
-                        else:
-                            value = torch.empty(param.shape, dtype=model.dtype)
-                            nn.init.kaiming_uniform_(value, a=math.sqrt(5))
-                    elif 'patch_embedding_xyz' in name and 'weight' in name:
-                        # Initialize from base patch_embedding (first 16 channels)
-                        base_pe = model.patch_embedding.weight
-                        if not base_pe.is_meta:
-                            value = base_pe.data[:, :param.shape[1]].clone().to(model.dtype)
-                        else:
-                            value = torch.empty(param.shape, dtype=model.dtype)
-                            nn.init.kaiming_uniform_(value, a=math.sqrt(5))
-                    elif 'patch_embedding_xyz' in name and 'bias' in name:
-                        base_bias = model.patch_embedding.bias
-                        if base_bias is not None and not base_bias.is_meta:
-                            value = base_bias.data.clone().to(model.dtype)
-                        else:
-                            value = torch.zeros(param.shape, dtype=model.dtype)
-                    else:
-                        value = torch.empty(param.shape, dtype=model.dtype)
-
-                    # Navigate to parent module and replace the parameter
-                    parts = name.split('.')
-                    parent = model
-                    for part in parts[:-1]:
-                        parent = getattr(parent, part)
-                    setattr(parent, parts[-1], nn.Parameter(value))
-
-            if meta_params_found:
-                logger.info("Materialized specific meta tensors (patch_embedding_xyz, dlc_*)")
-
-            logger.info("Loaded checkpoint directly.")
+            if model.learnable_domain_embeddings.is_meta:
+                model.learnable_domain_embeddings = nn.Parameter(
+                    torch.zeros(model.learnable_domain_embeddings.shape, dtype=model.dtype)
+                ).to(model.device)
+                logger.info("Convert Meta learnable domain embeddings to zeros.")
+            logger.info("Loaded Custom Model checkpoint directly.")
             return model
         except Exception as e:
-            logger.info(f"Direct load failed ({e}), loading from base WanTransformer3DModel...")
-
-        base_model = WanTransformer3DModel.from_pretrained(
-            pretrained_model_name_or_path, **kwargs,
-        )
-        config = dict(base_model.config)
-
-        # Remove internal keys
-        for k in ['_class_name', '_diffusers_version', '_name_or_path']:
-            config.pop(k, None)
-
-        model = cls(**config)
-        model_dict = model.state_dict()
-
-        base_state = base_model.state_dict()
-        filtered_dict = {
-            k: v for k, v in base_state.items()
-            if k in model_dict and model_dict[k].shape == v.shape
-        }
-        for k in base_state.keys():
-            if k not in filtered_dict:
-                logger.info(f"Skipping key {k} due to size mismatch.")
-
-        # Initialize patch_embedding_xyz from base patch_embedding (16ch subset)
-        if "patch_embedding.weight" in base_state and "patch_embedding_xyz.weight" in model_dict:
-            base_pe_w = base_state["patch_embedding.weight"]  # [D, 36, 1, 2, 2]
-            xyz_pe_w = model_dict["patch_embedding_xyz.weight"]  # [D, 16, 1, 2, 2]
-            if base_pe_w.shape[0] == xyz_pe_w.shape[0]:
-                # Copy the first 16 input channels from base
-                filtered_dict["patch_embedding_xyz.weight"] = base_pe_w[:, :xyz_pe_w.shape[1]]
-                logger.info("Initialized patch_embedding_xyz.weight from base patch_embedding (first 16ch)")
-        if "patch_embedding.bias" in base_state and "patch_embedding_xyz.bias" in model_dict:
-            filtered_dict["patch_embedding_xyz.bias"] = base_state["patch_embedding.bias"]
-
-        model_dict.update(filtered_dict)
-        model.load_state_dict(model_dict)
-        logger.info(f"Loaded {len(filtered_dict)} keys from base model")
-
-        del base_model, base_state
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+            logger.error(f"Failed to load as Custom Model: {e}")
+            logger.info("Attempting to load as WanTransformer3DModel and convert...")
+            base_model = WanTransformer3DModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+            config = dict(base_model.config)
+            model = cls(**config)
+            model_dict = model.state_dict()
+            filtered_dict = {
+                k: v for k, v in base_model.state_dict().items()
+                if k in model_dict and model_dict[k].shape == v.shape
+            }
+            for k in base_model.state_dict().keys():
+                if k not in filtered_dict:
+                    logger.info(f"Skipping key {k} due to size mismatch.")
+            model_dict.update(filtered_dict)
+            model.load_state_dict(model_dict)
         return model
 
 
 # =============================================================================
-# Dual-Branch Inference Pipeline
+# Inference Pipeline
 # =============================================================================
 
-class WanDualI2VPipeline(WanImageToVideoPipeline):
-    """Dual-branch inference pipeline with dual-branch denoising."""
+class WanSameRopeWBWImageToVideoPipeline(WanImageToVideoPipeline):
+    """Pipeline with dual-modality latent preparation (RGB + pointmap along width)."""
 
     def __init__(
         self,
@@ -468,14 +475,11 @@ class WanDualI2VPipeline(WanImageToVideoPipeline):
         text_encoder: UMT5EncoderModel,
         image_encoder: CLIPVisionModel,
         image_processor: CLIPImageProcessor,
-        transformer: WanDualTransformer3DModel,
+        transformer: WanTransformer3DModelDembSameRope,
         vae: AutoencoderKLWan,
         scheduler: FlowMatchEulerDiscreteScheduler,
     ):
-        super().__init__(
-            tokenizer, text_encoder, image_encoder, image_processor,
-            transformer, vae, scheduler,
-        )
+        super().__init__(tokenizer, text_encoder, image_encoder, image_processor, transformer, vae, scheduler)
 
     @override
     def prepare_latents(
@@ -484,67 +488,86 @@ class WanDualI2VPipeline(WanImageToVideoPipeline):
         batch_size: int,
         num_channels_latents: int = 16,
         height: int = 480,
-        width: int = 720,
-        num_frames: int = 49,
+        width: int = 832,
+        num_frames: int = 81,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
         last_image: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare dual latents and RGB-only condition."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
-        latent_width = width // self.vae_scale_factor_spatial
+        latent_width = width * 2 // self.vae_scale_factor_spatial
 
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
 
-        latents_rgb = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        latents_xyz = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device=device, dtype=dtype)
 
-        # Condition: only RGB first frame
         image = image.unsqueeze(2)
-        video_condition = torch.cat(
-            [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 1, height, width)],
-            dim=2,
-        )
+        pointmap = generate_uniform_pointmap(height, width)
+        pointmap = torch.from_numpy(pointmap).to(device=device, dtype=dtype).permute(2, 0, 1)[None, :, None, :, :] * 2 - 1
+        image = torch.concat([image, pointmap], dim=4)
+        if last_image is None:
+            video_condition = torch.cat(
+                [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 1, height, width * 2)], dim=2
+            )
+        else:
+            last_image = last_image.unsqueeze(2)
+            video_condition = torch.cat(
+                [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 2, height, width * 2), last_image],
+                dim=2,
+            )
         video_condition = video_condition.to(device=device, dtype=self.vae.dtype)
 
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(device, dtype)
+            .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        ).to(device, dtype)
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
 
-        latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
-        latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+        if isinstance(generator, list):
+            latent_condition = [
+                retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax") for _ in generator
+            ]
+            latent_condition = torch.cat(latent_condition)
+        else:
+            latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+
         latent_condition = latent_condition.to(dtype)
         latent_condition = (latent_condition - latents_mean) * latents_std
 
-        # Mask: first frame = 1, rest = 0
         mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, latent_width)
-        mask_lat_size[:, :, list(range(1, num_frames))] = 0
+
+        if last_image is None:
+            mask_lat_size[:, :, list(range(1, num_frames))] = 0
+        else:
+            mask_lat_size[:, :, list(range(1, num_frames - 1))] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
-        first_frame_mask = torch.repeat_interleave(
-            first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal,
-        )
+        first_frame_mask[:, :, :, :, latent_condition.shape[4] // 2:] = 0.5
+        first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal)
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
-        mask_lat_size = mask_lat_size.view(
-            batch_size, -1, self.vae_scale_factor_temporal, latent_height, latent_width,
-        )
+        mask_lat_size = mask_lat_size.view(batch_size, -1, self.vae_scale_factor_temporal, latent_height, latent_width)
         mask_lat_size = mask_lat_size.transpose(1, 2)
         mask_lat_size = mask_lat_size.to(latent_condition.device)
 
-        condition = torch.concat([mask_lat_size, latent_condition], dim=1)
-
-        return latents_rgb, latents_xyz, condition
+        return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
 
 # =============================================================================
-# Dual-Branch Trainer
+# Trainer
 # =============================================================================
 
 class WanDualTrainer(Trainer):
@@ -558,7 +581,7 @@ class WanDualTrainer(Trainer):
         components.pipeline_cls = WanImageToVideoPipeline
         components.tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
-        components.transformer = WanDualTransformer3DModel.from_pretrained(
+        components.transformer = WanTransformer3DModelDembSameRope.from_pretrained(
             model_path, subfolder="transformer",
         )
         components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
@@ -574,8 +597,8 @@ class WanDualTrainer(Trainer):
 
     @override
     def prepare_trainable_parameters(self):
-        """Use PEFT LoRA with two named adapters (rgb, xyz) + DLC + patch_embedding_xyz."""
-        logger.info("Initializing trainable parameters (PEFT dual LoRA + DLC)")
+        """Use PEFT LoRA (single adapter) + learnable_domain_embeddings."""
+        logger.info("Initializing trainable parameters (PEFT LoRA + learnable_domain_embeddings)")
 
         weight_dtype = self.state.weight_dtype
 
@@ -584,23 +607,20 @@ class WanDualTrainer(Trainer):
             if hasattr(component, "requires_grad_"):
                 component.requires_grad_(False)
 
-        # Add two PEFT LoRA adapters
+        # Add single PEFT LoRA adapter
         lora_config = LoraConfig(
             r=self.args.rank,
             lora_alpha=self.args.lora_alpha,
             init_lora_weights=True,
             target_modules=self.args.target_modules,
         )
-        self.components.transformer.add_adapter(lora_config, adapter_name="rgb")
-        self.components.transformer.add_adapter(lora_config, adapter_name="xyz")
-        # Enable both adapters for training (both get gradients)
-        self.components.transformer.set_adapter(["rgb", "xyz"])
-        logger.info(f"Added PEFT LoRA adapters 'rgb' and 'xyz' (rank={self.args.rank})")
+        self.components.transformer.add_adapter(lora_config)
 
-        # Unfreeze DLC + patch_embedding_xyz
+        # Unfreeze learnable_domain_embeddings
         for name, param in self.components.transformer.named_parameters():
-            if 'dlc_' in name or 'patch_embedding_xyz' in name:
+            if 'learnable_domain_embeddings' in name:
                 param.requires_grad_(True)
+                logger.info(f"Training {name} after adding LoRA")
 
         # Log trainable parameter count
         trainable_count = sum(
@@ -624,40 +644,33 @@ class WanDualTrainer(Trainer):
         if self.args.gradient_checkpointing:
             self.components.transformer.enable_gradient_checkpointing()
 
-        # Register custom saving/loading hooks
+        # Register save/load hooks compatible with reference project format
         self._register_hooks(lora_config)
 
     def _register_hooks(self, lora_config):
-        """Register custom save/load hooks (PEFT LoRA + DLC + patch_embedding_xyz)."""
+        """Register save/load hooks that produce reference-compatible weight files.
+
+        Saves:
+        - pytorch_lora_weights.safetensors (standard PEFT format)
+        - learnable_domain_embeddings.pt (separate file)
+        """
 
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
                 for model in models:
                     unwrapped = unwrap_model(self.accelerator, model)
-                    if isinstance(unwrapped, WanDualTransformer3DModel):
-                        # Save RGB LoRA
-                        rgb_state = get_peft_model_state_dict(unwrapped, adapter_name="rgb")
-                        rgb_state_prefixed = {f"rgb.{k}": v for k, v in rgb_state.items()}
-
-                        # Save XYZ LoRA
-                        xyz_state = get_peft_model_state_dict(unwrapped, adapter_name="xyz")
-                        xyz_state_prefixed = {f"xyz.{k}": v for k, v in xyz_state.items()}
-
-                        # Save DLC + patch_embedding_xyz
-                        extra_state = {
-                            k: v for k, v in unwrapped.state_dict().items()
-                            if 'dlc_' in k or 'patch_embedding_xyz' in k
-                        }
-
-                        # Combine all into one file
-                        combined = {**rgb_state_prefixed, **xyz_state_prefixed, **extra_state}
-                        save_path = os.path.join(output_dir, "weights.safetensors")
-                        from safetensors.torch import save_file
-                        save_file(combined, save_path)
-                        logger.info(
-                            f"Saved weights: {len(rgb_state)} rgb LoRA + "
-                            f"{len(xyz_state)} xyz LoRA + {len(extra_state)} extra to {save_path}"
+                    if isinstance(unwrapped, WanTransformer3DModelDembSameRope):
+                        # Save LoRA weights via standard PEFT pipeline API
+                        transformer_lora_layers = get_peft_model_state_dict(unwrapped)
+                        self.components.pipeline_cls.save_lora_weights(
+                            output_dir,
+                            transformer_lora_layers=transformer_lora_layers,
                         )
+
+                        # Save learnable_domain_embeddings separately
+                        demb_path = os.path.join(output_dir, "learnable_domain_embeddings.pt")
+                        torch.save(unwrapped.learnable_domain_embeddings.data.cpu(), demb_path)
+                        logger.info(f"Saved LoRA weights + learnable_domain_embeddings to {output_dir}")
 
                     if weights:
                         weights.pop()
@@ -666,38 +679,40 @@ class WanDualTrainer(Trainer):
             while len(models) > 0:
                 model = models.pop()
                 unwrapped = unwrap_model(self.accelerator, model)
-                if isinstance(unwrapped, WanDualTransformer3DModel):
-                    load_path = os.path.join(input_dir, "weights.safetensors")
-                    if os.path.exists(load_path):
-                        from safetensors.torch import load_file
-                        combined = load_file(load_path)
+                if isinstance(unwrapped, WanTransformer3DModelDembSameRope):
+                    # Load LoRA weights
+                    lora_state_dict = self.components.pipeline_cls.lora_state_dict(input_dir)
+                    transformer_state_dict = {
+                        f'{k.replace("transformer.", "")}': v
+                        for k, v in lora_state_dict.items()
+                        if k.startswith("transformer.")
+                    }
+                    incompatible_keys = set_peft_model_state_dict(
+                        unwrapped, transformer_state_dict, adapter_name="default"
+                    )
+                    if incompatible_keys is not None:
+                        unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                        if unexpected_keys:
+                            logger.warning(
+                                f"Loading adapter weights led to unexpected keys: {unexpected_keys}"
+                            )
 
-                        # Split RGB LoRA
-                        rgb_state = {k[4:]: v for k, v in combined.items() if k.startswith("rgb.")}
-                        if rgb_state:
-                            set_peft_model_state_dict(unwrapped, rgb_state, adapter_name="rgb")
-
-                        # Split XYZ LoRA
-                        xyz_state = {k[4:]: v for k, v in combined.items() if k.startswith("xyz.")}
-                        if xyz_state:
-                            set_peft_model_state_dict(unwrapped, xyz_state, adapter_name="xyz")
-
-                        # Load DLC + patch_embedding_xyz
-                        extra_state = {
-                            k: v for k, v in combined.items()
-                            if not k.startswith("rgb.") and not k.startswith("xyz.")
-                        }
-                        if extra_state:
-                            unwrapped.load_state_dict(extra_state, strict=False)
-
-                        logger.info(f"Loaded weights from {load_path}")
+                    # Load learnable_domain_embeddings
+                    demb_path = os.path.join(input_dir, "learnable_domain_embeddings.pt")
+                    if os.path.exists(demb_path):
+                        demb = torch.load(demb_path, map_location="cpu")
+                        unwrapped.learnable_domain_embeddings.data = demb.to(
+                            unwrapped.learnable_domain_embeddings.device,
+                            unwrapped.learnable_domain_embeddings.dtype,
+                        )
+                        logger.info(f"Loaded learnable_domain_embeddings from {demb_path}")
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
     @override
     def initialize_pipeline(self) -> WanImageToVideoPipeline:
-        pipe = WanDualI2VPipeline(
+        pipe = WanImageToVideoPipeline(
             tokenizer=self.components.tokenizer,
             text_encoder=self.components.text_encoder,
             vae=self.components.vae,
@@ -764,6 +779,7 @@ class WanDualTrainer(Trainer):
 
     @override
     def compute_loss(self, batch) -> torch.Tensor:
+        """Single-stream flow matching loss with dual-modality mask."""
         prompt_embedding = batch["prompt_embedding"].to(self.components.transformer.dtype)
         latent = batch["encoded_videos"].to(self.components.transformer.dtype)
         images = batch["images"]
@@ -772,37 +788,28 @@ class WanDualTrainer(Trainer):
         batch_size, num_channels, num_frames, height, width = latent.shape
         vae_scale_factor_temporal = 2 ** sum(self.components.vae.config.temperal_downsample)
 
-        # Split RGB and XYZ latents (concatenated along width in dataset)
-        W = width // 2
-        latent_rgb = latent[..., :W]
-        latent_xyz = latent[..., W:]
-
         _, seq_len, _ = prompt_embedding.shape
-        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_rgb.dtype)
+        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
 
-        # Build RGB-only condition (UMC)
-        image_W = images.shape[-1] // 2
-        image_rgb = images[..., :image_W]
-
+        # Build condition from first frame image (already concatenated RGB + pointmap along width)
         num_real_frames = (num_frames - 1) * vae_scale_factor_temporal + 1
-        image_rgb = image_rgb.unsqueeze(2)
-        video_condition = torch.cat(
-            [image_rgb, image_rgb.new_zeros(
-                image_rgb.shape[0], image_rgb.shape[1],
-                num_real_frames - 1, image_rgb.shape[3], image_rgb.shape[4],
-            )],
-            dim=2,
-        )
+        images = images.unsqueeze(2)
+        video_condition = torch.cat([
+            images,
+            images.new_zeros(images.shape[0], images.shape[1], num_real_frames - 1, images.shape[3], images.shape[4]),
+        ], dim=2)
         with torch.no_grad():
             latent_condition = self.encode_video(video_condition)
 
-        # Mask: first frame = 1, rest = 0
+        # Build mask with 0/0.5/1 values
         mask_lat_size = torch.ones(
             latent_condition.shape[0], 1, num_real_frames,
             latent_condition.shape[3], latent_condition.shape[4],
         )
         mask_lat_size[:, :, list(range(1, num_real_frames))] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
+        # Mark pointmap half of first frame with 0.5
+        first_frame_mask[:, :, :, :, latent_condition.shape[4] // 2:] = 0.5
         first_frame_mask = torch.repeat_interleave(
             first_frame_mask, dim=2, repeats=vae_scale_factor_temporal,
         )
@@ -821,74 +828,36 @@ class WanDualTrainer(Trainer):
             0, self.components.scheduler.config.num_train_timesteps, (batch_size,),
         )
         timesteps_idx = timesteps_idx.long()
-        timesteps = self.components.scheduler.timesteps[timesteps_idx].to(device=latent_rgb.device)
-        sigmas = self.get_sigmas(timesteps, n_dim=latent_rgb.ndim, dtype=latent_rgb.dtype)
+        timesteps = self.components.scheduler.timesteps[timesteps_idx].to(device=latent.device)
+        sigmas = self.get_sigmas(timesteps, n_dim=latent.ndim, dtype=latent.dtype)
 
         # Add noise
-        noise_rgb = torch.randn_like(latent_rgb)
-        noise_xyz = torch.randn_like(latent_xyz)
-        noisy_rgb = (1.0 - sigmas) * latent_rgb + sigmas * noise_rgb
-        noisy_xyz = (1.0 - sigmas) * latent_xyz + sigmas * noise_xyz
+        noise = torch.randn_like(latent)
+        noisy_latents = (1.0 - sigmas) * latent + sigmas * noise
+        target = noise - latent
 
-        # Build model inputs
-        rgb_input = torch.cat([noisy_rgb, condition], dim=1)  # [B, 36, F, H, W]
-        xyz_input = noisy_xyz  # [B, 16, F, H, W]
+        # Concatenate noisy latent with condition
+        latent_model_input = torch.cat([noisy_latents, condition], dim=1)
 
-        # Forward (transformer handles adapter switching internally)
-        pred_rgb, pred_xyz = self.components.transformer(
-            hidden_states_rgb=rgb_input,
-            hidden_states_xyz=xyz_input,
+        # Single forward pass through transformer
+        predicted_noise = self.components.transformer(
+            hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embedding,
             encoder_hidden_states_image=image_embedding,
             timestep=timesteps,
+            return_dict=False,
+        )[0]
+
+        loss = torch.mean(
+            ((predicted_noise.float() - target.float()) ** 2).reshape(batch_size, -1), dim=1,
         )
+        loss = loss.mean()
 
-        # Flow matching target
-        target_rgb = noise_rgb - latent_rgb
-        target_xyz = noise_xyz - latent_xyz
-
-        loss_rgb = torch.mean(
-            ((pred_rgb.float() - target_rgb.float()) ** 2).reshape(batch_size, -1), dim=1,
-        ).mean()
-        loss_xyz = torch.mean(
-            ((pred_xyz.float() - target_xyz.float()) ** 2).reshape(batch_size, -1), dim=1,
-        ).mean()
-
-        loss_total = loss_rgb + loss_xyz
-        loss_rgb_value = float(loss_rgb.detach().item())
-        loss_xyz_value = float(loss_xyz.detach().item())
-        loss_total_value = float(loss_total.detach().item())
-        eps = 1e-8
-
-        # Timestep bucket: 0=low noise (t<333), 1=mid (333-666), 2=high noise (t>=666)
-        num_train_t = self.components.scheduler.config.num_train_timesteps
-        t_val = int(timesteps_idx[0].item())  # batch_size=1 typically
-        bucket = 0 if t_val < num_train_t // 3 else (1 if t_val < 2 * num_train_t // 3 else 2)
-
-        # Keep One4D branch-wise metrics for external logging (TensorBoard/SwanLab).
-        metrics = {
-            "loss_rgb": loss_rgb_value,
-            "loss_xyz": loss_xyz_value,
-            "loss_ratio_rgb": loss_rgb_value / (loss_total_value + eps),
-            "loss_ratio_xyz": loss_xyz_value / (loss_total_value + eps),
-            "loss_gap_abs": abs(loss_rgb_value - loss_xyz_value),
-            "loss_gap_rel": abs(loss_rgb_value - loss_xyz_value) / (max(loss_rgb_value, loss_xyz_value) + eps),
-            "sampled_timestep": float(t_val),
-            "timestep_bucket": float(bucket),
-        }
-
-        unwrapped_transformer = unwrap_model(self.accelerator, self.components.transformer)
-        coupling_metrics = getattr(unwrapped_transformer, "_last_coupling_metrics", None)
-        if isinstance(coupling_metrics, dict):
-            metrics.update(coupling_metrics)
-
-        self.state.latest_loss_metrics = metrics
-
-        return loss_total
+        return loss
 
     @override
     def validation_step(
-        self, eval_data: Dict[str, Any], pipe: WanDualI2VPipeline,
+        self, eval_data: Dict[str, Any], pipe: WanImageToVideoPipeline,
     ) -> List[Tuple[str, Image.Image | List[Image.Image]]]:
         prompt, image, video = eval_data["prompt"], eval_data["image"], eval_data["video"]
         return []

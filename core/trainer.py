@@ -385,7 +385,8 @@ class Trainer:
             f"  README.md            # This file\n"
             f"  checkpoints/         # Model checkpoints (step-NNNNNN/)\n"
             f"    step-NNNNNN/\n"
-            f"      weights.safetensors  # LoRA + DLC + patch_embedding_xyz\n"
+            f"      pytorch_lora_weights.safetensors  # LoRA adapter weights\n"
+            f"      learnable_domain_embeddings.pt    # Domain embedding parameter\n"
             f"      optimizer.bin        # Optimizer state\n"
             f"      scheduler.bin        # LR scheduler state\n"
             f"      random_states_*.pkl  # RNG states for reproducibility\n"
@@ -432,7 +433,7 @@ class Trainer:
         banner = (
             "\n"
             "══════════════════════════════════════════════════════════\n"
-            "  One4D Training\n"
+            "  4DNeX Training\n"
             f"  Model: {self.args.model_path.name} | {self.args.training_type} rank={self.args.rank}\n"
             f"  Resolution: {res[0]}x{res[1]}x{res[2]}\n"
             f"  Params: {trainable:,} trainable / {total_params:,} total ({pct:.2f}%)\n"
@@ -558,25 +559,13 @@ class Trainer:
                 if "grad_norm" in logs:
                     logs["optim/grad_norm"] = float(logs["grad_norm"])
 
-                for key in ["optim/grad_norm_rgb_lora", "optim/grad_norm_xyz_lora", "optim/grad_norm_dlc"]:
+                for key in ["optim/grad_norm_lora", "optim/grad_norm_domain_emb"]:
                     if key in logs:
                         logs[key] = float(logs[key])
 
                 if self.state.latest_loss_metrics:
-                    one4d_metric_keys = [
-                        "loss_rgb",
-                        "loss_xyz",
-                        "loss_ratio_rgb",
-                        "loss_ratio_xyz",
-                        "loss_gap_abs",
-                        "loss_gap_rel",
-                        "dlc_coupling_rgb",
-                        "dlc_coupling_xyz",
-                        "dlc_balance_gap",
-                    ]
-                    for metric_key in one4d_metric_keys:
-                        if metric_key in self.state.latest_loss_metrics:
-                            logs[f"train/{metric_key}"] = float(self.state.latest_loss_metrics[metric_key])
+                    for metric_key, val in self.state.latest_loss_metrics.items():
+                        logs[f"train/{metric_key}"] = float(val)
 
                 if torch.cuda.is_available() and accelerator.device.type == "cuda":
                     mem_alloc = torch.cuda.memory_allocated(accelerator.device) / (1024**3)
@@ -612,15 +601,7 @@ class Trainer:
                     {
                         "epoch": f"{epoch+1}/{self.args.train_epochs}",
                         "loss": f"{loss_scalar:.4f}",
-                        "rgb": (
-                            f"{logs['train/loss_rgb']:.4f}" if "train/loss_rgb" in logs else "n/a"
-                        ),
-                        "xyz": (
-                            f"{logs['train/loss_xyz']:.4f}" if "train/loss_xyz" in logs else "n/a"
-                        ),
-                        "ratio": (
-                            f"{logs['train/loss_ratio_rgb']:.2f}" if "train/loss_ratio_rgb" in logs else "n/a"
-                        ),
+                        "ema": f"{ema_loss:.4f}",
                         "lr": f"{logs['lr']:.1e}",
                         "grad": f"{logs['grad_norm']:.2f}" if "grad_norm" in logs else "n/a",
                         "s/it": f"{step_time_sec:.1f}",
@@ -632,21 +613,16 @@ class Trainer:
                 if accelerator.is_main_process and accelerator.sync_gradients and global_step % 10 == 0:
                     _r = lambda k, d=0.0: round(float(logs.get(k, d)), 4)
                     _mem = f" mem={mem_alloc:.1f}G" if torch.cuda.is_available() and accelerator.device.type == "cuda" else ""
-                    _gap_pct = f"{_r('train/loss_gap_rel') * 100:.1f}%"
                     console_line = (
                         f"[Step {global_step}/{self.args.train_steps}] "
                         f"loss={loss_scalar:.4f} ema={ema_loss:.4f} | "
-                        f"rgb={_r('train/loss_rgb'):.4f} xyz={_r('train/loss_xyz'):.4f} "
-                        f"ratio={_r('train/loss_ratio_rgb'):.2f}/{_r('train/loss_ratio_xyz'):.2f} gap={_gap_pct} | "
-                        f"dlc={_r('train/dlc_coupling_rgb'):.3f}/{_r('train/dlc_coupling_xyz'):.3f} | "
                         f"lr={logs.get('lr', 0):.1e} "
                         f"grad={_r('optim/grad_norm'):.2f} "
-                        f"(rgb={_r('optim/grad_norm_rgb_lora'):.2f} xyz={_r('optim/grad_norm_xyz_lora'):.2f} dlc={_r('optim/grad_norm_dlc'):.3f}) | "
+                        f"(lora={_r('optim/grad_norm_lora'):.2f} demb={_r('optim/grad_norm_domain_emb'):.3f}) | "
                         f"{step_time_sec:.1f}s/it{_mem}"
                     )
                     logger.info(console_line)
-                    # Also keep JSON for machine parsing at debug level
-                    logger.debug(f"One4D metrics: {json.dumps({k: v for k, v in logs.items() if k.startswith(('train/', 'optim/'))}, ensure_ascii=True)}")
+                    logger.debug(f"Metrics: {json.dumps({k: v for k, v in logs.items() if k.startswith(('train/', 'optim/'))}, ensure_ascii=True)}")
 
                 # Maybe run validation
                 should_run_validation = self.args.do_validation and global_step % self.args.validation_steps == 0
@@ -879,12 +855,11 @@ class Trainer:
             raise ValueError(f"Invalid mixed precision: {self.args.mixed_precision}")
 
     def __compute_one4d_branch_grad_norms(self) -> Dict[str, float]:
-        """Compute grouped grad norms for One4D trainable groups.
+        """Compute grouped grad norms for trainable parameter groups.
 
         Groups:
-        - RGB LoRA adapter params
-        - XYZ LoRA adapter params
-        - DLC params
+        - LoRA adapter params
+        - learnable_domain_embeddings
         """
         try:
             model = unwrap_model(self.accelerator, self.components.transformer)
@@ -892,9 +867,8 @@ class Trainer:
             return {}
 
         group_sum_sq = {
-            "rgb_lora": 0.0,
-            "xyz_lora": 0.0,
-            "dlc": 0.0,
+            "lora": 0.0,
+            "domain_emb": 0.0,
         }
 
         for name, param in model.named_parameters():
@@ -903,17 +877,10 @@ class Trainer:
             name_lower = name.lower()
             grad_sq = float(torch.sum(param.grad.detach().float() ** 2).item())
 
-            if "dlc_" in name_lower:
-                group_sum_sq["dlc"] += grad_sq
-                continue
-
-            if "lora" not in name_lower:
-                continue
-
-            if "rgb" in name_lower:
-                group_sum_sq["rgb_lora"] += grad_sq
-            elif "xyz" in name_lower:
-                group_sum_sq["xyz_lora"] += grad_sq
+            if "learnable_domain_embeddings" in name_lower:
+                group_sum_sq["domain_emb"] += grad_sq
+            elif "lora" in name_lower:
+                group_sum_sq["lora"] += grad_sq
 
         grad_metrics: Dict[str, float] = {}
         for key, sum_sq in group_sum_sq.items():
@@ -923,13 +890,13 @@ class Trainer:
         return grad_metrics
 
     def __compute_lora_weight_norms(self) -> Dict[str, float]:
-        """Compute L2 norms of LoRA adapter weights (how far they've moved from init)."""
+        """Compute L2 norms of trainable weights (how far they've moved from init)."""
         try:
             model = unwrap_model(self.accelerator, self.components.transformer)
         except Exception:
             return {}
 
-        group_sum_sq = {"rgb_lora": 0.0, "xyz_lora": 0.0, "dlc": 0.0}
+        group_sum_sq = {"lora": 0.0, "domain_emb": 0.0}
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -937,13 +904,10 @@ class Trainer:
             name_lower = name.lower()
             w_sq = float(torch.sum(param.detach().float() ** 2).item())
 
-            if "dlc_" in name_lower:
-                group_sum_sq["dlc"] += w_sq
+            if "learnable_domain_embeddings" in name_lower:
+                group_sum_sq["domain_emb"] += w_sq
             elif "lora" in name_lower:
-                if "rgb" in name_lower:
-                    group_sum_sq["rgb_lora"] += w_sq
-                elif "xyz" in name_lower:
-                    group_sum_sq["xyz_lora"] += w_sq
+                group_sum_sq["lora"] += w_sq
 
         norms: Dict[str, float] = {}
         for key, sum_sq in group_sum_sq.items():
@@ -992,15 +956,11 @@ class Trainer:
                     transformer_lora_layers=transformer_lora_layers_to_save,
                 )
 
-                # Save extra trainable parameters (e.g. learnable_domain_embeddings)
+                # Save learnable_domain_embeddings as raw tensor (reference-compatible format)
                 model = unwrap_model(self.accelerator, self.components.transformer)
-                extra_state = {
-                    k: v for k, v in model.state_dict().items()
-                    if 'learnable_domain_embeddings' in k
-                }
-                if extra_state:
+                if hasattr(model, 'learnable_domain_embeddings'):
                     torch.save(
-                        extra_state,
+                        model.learnable_domain_embeddings.data.cpu(),
                         os.path.join(output_dir, "learnable_domain_embeddings.pt"),
                     )
 
@@ -1036,6 +996,15 @@ class Trainer:
                         f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
                         f" {unexpected_keys}. "
                     )
+
+            # Load learnable_domain_embeddings if present
+            demb_path = os.path.join(input_dir, "learnable_domain_embeddings.pt")
+            if os.path.exists(demb_path) and hasattr(transformer_, 'learnable_domain_embeddings'):
+                demb = torch.load(demb_path, map_location="cpu")
+                transformer_.learnable_domain_embeddings.data = demb.to(
+                    transformer_.learnable_domain_embeddings.device,
+                    transformer_.learnable_domain_embeddings.dtype,
+                )
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)

@@ -84,7 +84,7 @@ def get_latent_cache_path(cache_dir, index, prompt, image_path, args):
         f"idx={index}|prompt={prompt}|image={image_path}|"
         f"seed={args.seed}|frames={args.num_frames}|steps={args.num_inference_steps}|"
         f"cfg={args.guidance_scale}|h={args.height}|w={args.width}|"
-        f"rank={args.rank}|alpha={args.lora_alpha}|weights={args.weights_path}"
+        f"rank={args.rank}|lora={args.lora_path}"
     )
     cache_key = hashlib.sha1(cache_key_raw.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"{index:05d}_{cache_key}.pt")
@@ -207,15 +207,14 @@ def main(args):
                 prompt=prompt,
                 image_or_video_path=image_path,
                 model_path=args.model_path,
-                weights_path=args.weights_path,
+                lora_path=args.lora_path,
                 num_frames=args.num_frames,
                 width=args.width,
                 height=args.height,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
-                rank=args.rank,
-                lora_alpha=args.lora_alpha,
+                lora_rank=args.rank,
                 dtype=torch.bfloat16,
                 offload_mode=args.offload_mode,
                 output_on_cpu=effective_latents_on_cpu,
@@ -228,7 +227,7 @@ def main(args):
                     "guidance_scale": args.guidance_scale,
                     "height": args.height,
                     "width": args.width,
-                    "weights_path": args.weights_path,
+                    "lora_path": args.lora_path,
                 }
                 save_latent_cache(cache_path, latents_rgb, latents_xyz, meta)
                 print(f"  Saved denoised latents to cache: {cache_path}")
@@ -315,8 +314,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
     parser.add_argument("--model_path", type=str, default="pretrained/Wan2.1-I2V-14B-480P-Diffusers",
                         help="Path to pretrained Wan model")
-    parser.add_argument("--weights_path", type=str, required=True,
-                        help="Path to trained weights (dir or .safetensors file)")
+    parser.add_argument("--lora_path", type=str, required=True,
+                        help="Path to LoRA weights directory (containing pytorch_lora_weights.safetensors + learnable_domain_embeddings.pt)")
     parser.add_argument("--out", type=str, default="results", help="Output directory")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
@@ -326,7 +325,6 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--rank", type=int, default=64, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--offload_mode", type=str, default="model",
                         choices=["model", "sequential", "none"],
                         help="CPU offload strategy: "
