@@ -44,6 +44,13 @@ logger.setLevel(LOG_LEVEL)
 ENCODED_PM_MEAN = -0.13
 ENCODED_PM_STD = 1.70
 
+# ---------------------------------------------------------------------------
+# !!! TEMP HACK (MEMORY DEBUG) !!!
+# Keep only first 13 latent frames to match refer behavior
+# (roughly corresponds to 49 real frames before VAE temporal compression).
+# ---------------------------------------------------------------------------
+HACK_FORCE_LATENT_FRAMES = 13
+
 
 class BaseDataset(Dataset):
     """Base dataset that reads from the ``index.json`` structure.
@@ -159,6 +166,22 @@ class BaseDataset(Dataset):
         num_frames = min(encoded_video.shape[1], encoded_pm.shape[1])
         encoded_video = encoded_video[:, :num_frames, :, :]
         encoded_pm = encoded_pm[:, :num_frames, :, :]
+
+        # !!! TEMP HACK (MEMORY DEBUG): force 13 latent frames like refer !!!
+        # This intentionally changes training behavior to reduce memory usage.
+        if num_frames < HACK_FORCE_LATENT_FRAMES:
+            raise ValueError(
+                f"Insufficient latent frames: got {num_frames}, "
+                f"need >= {HACK_FORCE_LATENT_FRAMES} for temporary memory-debug hack"
+            )
+        if num_frames != HACK_FORCE_LATENT_FRAMES:
+            logger.warning(
+                "[TEMP HACK ENABLED] Forcing latent frames from %s to %s to match refer memory profile.",
+                num_frames,
+                HACK_FORCE_LATENT_FRAMES,
+            )
+        encoded_video = encoded_video[:, :HACK_FORCE_LATENT_FRAMES, :, :]
+        encoded_pm = encoded_pm[:, :HACK_FORCE_LATENT_FRAMES, :, :]
 
         # ---- XYZ training normalisation ----
         encoded_pm = (encoded_pm - ENCODED_PM_MEAN) / ENCODED_PM_STD
