@@ -1,4 +1,4 @@
-from core.models.trainer import WanTrainer
+from core.models.wan_trainer import WanTrainer
 from core.schemas import Args
 
 

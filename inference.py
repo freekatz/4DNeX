@@ -21,10 +21,10 @@ from transformers import CLIPVisionModel
 from diffusers.utils.loading_utils import load_image
 
 from core.models.wan import WanTransformer3DModelDembSameRope
-from core.models.pipeline import WanSameRopeImageToVideoPipeline
+from core.models.wan_pipeline import WanSameRopeImageToVideoPipeline
 from core.datasets.dataclass import Pointmap
 from core.datasets.dataset import ENCODED_PM_MEAN, ENCODED_PM_STD
-from core.models.tokenizer import WanTokenizer
+from core.models.wan_tokenizer import WanTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
