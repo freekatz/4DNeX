@@ -92,12 +92,12 @@ def save_pointmap(xyz_frames, rgb_frames, save_path):
         pickle.dump(pm, f)
 
 
-def get_latent_cache_path(cache_dir, index, prompt, image_path, args):
+def get_latent_cache_path(cache_dir, index, prompt, image_path, args, weights_path):
     cache_key_raw = (
         f"idx={index}|prompt={prompt}|image={image_path}|"
         f"seed={args.seed}|frames={args.num_frames}|steps={args.num_inference_steps}|"
         f"cfg={args.guidance_scale}|h={args.height}|w={args.width}|"
-        f"rank={args.rank}|lora={args.lora_path}"
+        f"rank={args.rank}|weights={weights_path}"
     )
     cache_key = hashlib.sha1(cache_key_raw.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"{index:05d}_{cache_key}.pt")
@@ -160,6 +160,20 @@ def load_from_clip_dir(clip_dir):
         image_list.append(str(image_file))
 
     return prompt_list, image_list
+
+
+def resolve_weights_path(args):
+    """Resolve adapter/checkpoint directory for inference weights.
+
+    Priority:
+    1) --weights_path (recommended for training artifacts)
+    2) --lora_path (backward compatible)
+    """
+    if args.weights_path:
+        return args.weights_path
+    if args.lora_path:
+        return args.lora_path
+    raise ValueError("Provide --weights_path (recommended) or --lora_path")
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +291,8 @@ def release_pipeline(pipe):
 
 
 def main(args):
+    weights_path = resolve_weights_path(args)
+
     if args.clip_dir is not None:
         prompt_list, image_list = load_from_clip_dir(args.clip_dir)
     else:
@@ -320,7 +336,7 @@ def main(args):
     for i in all_indices:
         prompt, image_path = prompt_list[i], image_list[i]
         prompt = prompt + ' POINTMAP_STYLE.'
-        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args)
+        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args, weights_path)
         if not (args.use_latent_cache and os.path.exists(cache_path)):
             needs_denoising = True
             break
@@ -330,7 +346,7 @@ def main(args):
     if needs_denoising:
         pipe = load_pipeline(
             model_path=args.model_path,
-            lora_path=args.lora_path,
+            lora_path=weights_path,
             lora_rank=args.rank,
             offload_mode=args.offload_mode,
             dtype=torch.bfloat16,
@@ -346,7 +362,7 @@ def main(args):
 
         print(f"[{i}/{len(prompt_list)}] Generating: {prompt[:60]}...")
 
-        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args)
+        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args, weights_path)
         if args.use_latent_cache and os.path.exists(cache_path):
             print(f"  Loading denoised latents from cache: {cache_path}")
             latents_rgb, latents_xyz, _ = load_latent_cache(cache_path)
@@ -371,7 +387,7 @@ def main(args):
                     "guidance_scale": args.guidance_scale,
                     "height": args.height,
                     "width": args.width,
-                    "lora_path": args.lora_path,
+                    "weights_path": weights_path,
                 }
                 save_latent_cache(cache_path, latents_rgb, latents_xyz, meta)
                 print(f"  Saved denoised latents to cache: {cache_path}")
@@ -472,8 +488,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
     parser.add_argument("--model_path", type=str, default="pretrained/Wan2.1-I2V-14B-480P-Diffusers",
                         help="Path to pretrained Wan model")
-    parser.add_argument("--lora_path", type=str, required=True,
-                        help="Path to LoRA weights directory (containing pytorch_lora_weights.safetensors + learnable_domain_embeddings.pt)")
+    parser.add_argument("--weights_path", type=str, default=None,
+                        help="Path to training checkpoint/adapter directory (recommended, e.g. training/checkpoints/step-000010)")
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="Backward-compatible alias of --weights_path")
     parser.add_argument("--out", type=str, default="results", help="Output directory")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
