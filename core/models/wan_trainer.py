@@ -4,9 +4,7 @@ Model definitions are in core.models.wan.
 Pipeline definition is in core.models.pipeline.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
-
-import os
+from typing import Any, Dict, List, Tuple
 
 import torch
 import numpy as np
@@ -19,14 +17,13 @@ from diffusers import (
 )
 from diffusers.utils import logging
 
-from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from typing_extensions import override
 
 from core.models.wan import WanTransformer3DModelDembSameRope
 from core.schemas import Components
 from core.trainer import Trainer
-from core.utils import unwrap_model, cast_training_params
+from core.utils import unwrap_model
 
 
 logger = logging.get_logger(__name__)
@@ -56,121 +53,6 @@ class WanTrainer(Trainer):
     @override
     def prepare_models(self) -> None:
         self.state.transformer_config = self.components.transformer.config
-
-    @override
-    def prepare_trainable_parameters(self):
-        """Use PEFT LoRA (single adapter) + learnable_domain_embeddings."""
-        logger.info("Initializing trainable parameters (PEFT LoRA + learnable_domain_embeddings)")
-
-        weight_dtype = self.state.weight_dtype
-
-        # Freeze everything first
-        for attr_name, component in vars(self.components).items():
-            if hasattr(component, "requires_grad_"):
-                component.requires_grad_(False)
-
-        # Add single PEFT LoRA adapter
-        lora_config = LoraConfig(
-            r=self.args.rank,
-            lora_alpha=self.args.lora_alpha,
-            init_lora_weights=True,
-            target_modules=self.args.target_modules,
-        )
-        self.components.transformer.add_adapter(lora_config)
-
-        # Unfreeze learnable_domain_embeddings
-        for name, param in self.components.transformer.named_parameters():
-            if 'learnable_domain_embeddings' in name:
-                param.requires_grad_(True)
-                logger.info(f"Training {name} after adding LoRA")
-
-        # Log trainable parameter count
-        trainable_count = sum(
-            p.numel() for p in self.components.transformer.parameters() if p.requires_grad
-        )
-        total_count = sum(p.numel() for p in self.components.transformer.parameters())
-        logger.info(
-            f"Trainable parameters: {trainable_count:,} / {total_count:,} "
-            f"({trainable_count / total_count * 100:.2f}%)"
-        )
-
-        # Move non-transformer components to device
-        ignore_list = ["transformer"] + self.UNLOAD_LIST
-        ignore_set = set(ignore_list)
-        components = self.components.model_dump()
-        for name, component in components.items():
-            if not isinstance(component, type) and hasattr(component, "to"):
-                if name not in ignore_set:
-                    setattr(self.components, name, component.to(self.accelerator.device, dtype=weight_dtype))
-
-        if self.args.gradient_checkpointing:
-            self.components.transformer.enable_gradient_checkpointing()
-
-        # Register save/load hooks compatible with reference project format
-        self._register_hooks(lora_config)
-
-    def _register_hooks(self, lora_config):
-        """Register save/load hooks that produce reference-compatible weight files.
-
-        Saves:
-        - pytorch_lora_weights.safetensors (standard PEFT format)
-        - learnable_domain_embeddings.pt (separate file)
-        """
-
-        def save_model_hook(models, weights, output_dir):
-            if self.accelerator.is_main_process:
-                for model in models:
-                    unwrapped = unwrap_model(self.accelerator, model)
-                    if isinstance(unwrapped, WanTransformer3DModelDembSameRope):
-                        # Save LoRA weights via standard PEFT pipeline API
-                        transformer_lora_layers = get_peft_model_state_dict(unwrapped)
-                        self.components.pipeline_cls.save_lora_weights(
-                            output_dir,
-                            transformer_lora_layers=transformer_lora_layers,
-                        )
-
-                        # Save learnable_domain_embeddings separately
-                        demb_path = os.path.join(output_dir, "learnable_domain_embeddings.pt")
-                        torch.save(unwrapped.learnable_domain_embeddings.data.cpu(), demb_path)
-                        logger.info(f"Saved LoRA weights + learnable_domain_embeddings to {output_dir}")
-
-                    if weights:
-                        weights.pop()
-
-        def load_model_hook(models, input_dir):
-            while len(models) > 0:
-                model = models.pop()
-                unwrapped = unwrap_model(self.accelerator, model)
-                if isinstance(unwrapped, WanTransformer3DModelDembSameRope):
-                    # Load LoRA weights
-                    lora_state_dict = self.components.pipeline_cls.lora_state_dict(input_dir)
-                    transformer_state_dict = {
-                        f'{k.replace("transformer.", "")}': v
-                        for k, v in lora_state_dict.items()
-                        if k.startswith("transformer.")
-                    }
-                    incompatible_keys = set_peft_model_state_dict(
-                        unwrapped, transformer_state_dict, adapter_name="default"
-                    )
-                    if incompatible_keys is not None:
-                        unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                        if unexpected_keys:
-                            logger.warning(
-                                f"Loading adapter weights led to unexpected keys: {unexpected_keys}"
-                            )
-
-                    # Load learnable_domain_embeddings
-                    demb_path = os.path.join(input_dir, "learnable_domain_embeddings.pt")
-                    if os.path.exists(demb_path):
-                        demb = torch.load(demb_path, map_location="cpu")
-                        unwrapped.learnable_domain_embeddings.data = demb.to(
-                            unwrapped.learnable_domain_embeddings.device,
-                            unwrapped.learnable_domain_embeddings.dtype,
-                        )
-                        logger.info(f"Loaded learnable_domain_embeddings from {demb_path}")
-
-        self.accelerator.register_save_state_pre_hook(save_model_hook)
-        self.accelerator.register_load_state_pre_hook(load_model_hook)
 
     @override
     def initialize_pipeline(self) -> WanImageToVideoPipeline:
