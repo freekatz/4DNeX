@@ -108,8 +108,8 @@ def load_latent_cache(cache_path):
 
 
 def load_list(path_or_value):
-    """Load a list from a file (one item per line) or treat as a single value."""
-    if os.path.isfile(path_or_value):
+    """Load a list from a .txt file (one item per line) or treat as a single value."""
+    if os.path.isfile(path_or_value) and path_or_value.lower().endswith('.txt'):
         with open(path_or_value, 'r') as f:
             return [line.strip() for line in f if line.strip()]
     return [path_or_value]
