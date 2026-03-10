@@ -61,7 +61,7 @@ class Args(BaseModel):
     ########## LoRA ##########
     rank: int = 64
     lora_alpha: int = 32
-    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"]
+    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0"]
 
     ########## Validation ##########
     do_validation: bool = False
