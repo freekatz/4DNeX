@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 import pickle
+import datetime
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -176,6 +177,12 @@ def resolve_weights_path(args):
     raise ValueError("Provide --weights_path (recommended) or --lora_path")
 
 
+def resolve_output_dir(base_out: str) -> str:
+    """Create a run-unique output directory by appending a timestamp suffix."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_out}-{ts}"
+
+
 # ---------------------------------------------------------------------------
 # Pipeline loading & inference
 # ---------------------------------------------------------------------------
@@ -292,6 +299,8 @@ def release_pipeline(pipe):
 
 def main(args):
     weights_path = resolve_weights_path(args)
+    run_out = resolve_output_dir(args.out)
+    print(f"[Info] Output directory: {run_out}")
 
     if args.clip_dir is not None:
         prompt_list, image_list = load_from_clip_dir(args.clip_dir)
@@ -319,9 +328,9 @@ def main(args):
         print("[Info] decode_device=cuda and decode_fast=true, setting latents_on_cpu=false to avoid extra copies")
         effective_latents_on_cpu = False
 
-    latent_cache_dir = args.latent_cache_dir or os.path.join(args.out, "latent_cache")
+    latent_cache_dir = args.latent_cache_dir or os.path.join(run_out, "latent_cache")
 
-    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(run_out, exist_ok=True)
 
     # Determine which indices this process handles
     all_indices = list(range(len(prompt_list)))
@@ -419,17 +428,17 @@ def main(args):
 
         # Decode and save RGB video
         print(f"  [{i}] Decoding RGB latent...")
-        rgb_path = os.path.join(args.out, f'{i:05d}_rgb.mp4')
+        rgb_path = os.path.join(run_out, f'{i:05d}_rgb.mp4')
         rgb_frames = decode_and_save(latents_rgb, tokenizer, rgb_path, mode='rgb', fps=args.fps)
 
         # Decode and save XYZ pointmap video
         print(f"  [{i}] Decoding XYZ latent...")
-        xyz_path = os.path.join(args.out, f'{i:05d}_xyz.mp4')
+        xyz_path = os.path.join(run_out, f'{i:05d}_xyz.mp4')
         xyz_frames = decode_and_save(latents_xyz, tokenizer, xyz_path, mode='xyz', fps=args.fps)
 
         # Save combined pointmap
         print(f"  [{i}] Saving pointmap pickle...")
-        pkl_path = os.path.join(args.out, f'{i:05d}.pkl')
+        pkl_path = os.path.join(run_out, f'{i:05d}.pkl')
         save_pointmap(xyz_frames, rgb_frames, pkl_path)
 
         print(f"  Saved: {rgb_path}, {xyz_path}, {pkl_path}")
@@ -466,7 +475,7 @@ def main(args):
                 K=K.cpu().numpy()[None].repeat(F, axis=0),
             )
 
-            opt_pkl_path = os.path.join(args.out, f'{i:05d}_optimized.pkl')
+            opt_pkl_path = os.path.join(run_out, f'{i:05d}_optimized.pkl')
             with open(opt_pkl_path, 'wb') as f:
                 pickle.dump(pm, f)
             print(f"  Saved optimized: {opt_pkl_path}")
@@ -492,7 +501,7 @@ if __name__ == "__main__":
                         help="Path to training checkpoint/adapter directory (recommended, e.g. training/checkpoints/step-000010)")
     parser.add_argument("--lora_path", type=str, default=None,
                         help="Backward-compatible alias of --weights_path")
-    parser.add_argument("--out", type=str, default="results", help="Output directory")
+    parser.add_argument("--out", type=str, default="results", help="Output directory prefix; timestamp suffix will be auto-appended")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
     parser.add_argument("--width", type=int, default=None, help="Output video width (must match model constraints)")

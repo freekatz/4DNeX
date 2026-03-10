@@ -112,7 +112,12 @@ class Args(BaseModel):
         p.add_argument("--output_dir", type=str, default=None)
         p.add_argument("--report_to", type=str, required=True)
         p.add_argument("--tracker_name", type=str, default="finetrainer")
-        p.add_argument("--experiment_name", type=str, default=None)
+        p.add_argument(
+            "--experiment_name",
+            type=str,
+            default=None,
+            help="Experiment name prefix; training will auto-append timestamp suffix",
+        )
 
         # Data
         p.add_argument("--data_root", type=str, required=True)
@@ -170,12 +175,19 @@ class Args(BaseModel):
 
         args = p.parse_args()
 
+        # Always generate a timestamped experiment name for unique run identity.
+        # Examples:
+        #   my-exp -> my-exp-20260310_153000
+        #   (missing) -> default-20260310_153000
+        run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_prefix = args.experiment_name if args.experiment_name else "default"
+        args.experiment_name = f"{exp_prefix}-{run_ts}"
+
         # Convert train_resolution string "81x480x720" to tuple
         frames, height, width = args.train_resolution.split("x")
         args.train_resolution = (int(frames), int(height), int(width))
 
         if args.output_dir is None:
-            exp_name = args.experiment_name if args.experiment_name else "default"
-            args.output_dir = f"training/{args.tracker_name}-{exp_name}"
+            args.output_dir = f"training/{args.tracker_name}-{args.experiment_name}"
 
         return cls(**vars(args))
