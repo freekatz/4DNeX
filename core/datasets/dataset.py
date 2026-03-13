@@ -18,24 +18,23 @@ Directory layout expected under ``data_root``::
 """
 
 import json
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import numpy as np
 import torch
+from accelerate.logging import get_logger
 from torch.utils.data import Dataset
 from torchvision import transforms
 from typing_extensions import override
 
 from core.constants import LOG_LEVEL, LOG_NAME
-from .utils import generate_uniform_pointmap, preprocess_image_with_resize
+from .utils import preprocess_image_with_resize
 
 if TYPE_CHECKING:
     from core.trainer import Trainer
 
-logger = logging.getLogger(LOG_NAME)
-logger.setLevel(LOG_LEVEL)
+logger = get_logger(LOG_NAME, LOG_LEVEL)
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +42,13 @@ logger.setLevel(LOG_LEVEL)
 # ---------------------------------------------------------------------------
 ENCODED_PM_MEAN = -0.13
 ENCODED_PM_STD = 1.70
+
+# ---------------------------------------------------------------------------
+# !!! TEMP HACK (MEMORY DEBUG) !!!
+# Keep only first 13 latent frames to match refer behavior
+# (roughly corresponds to 49 real frames before VAE temporal compression).
+# ---------------------------------------------------------------------------
+HACK_FORCE_LATENT_FRAMES = 13
 
 
 class BaseDataset(Dataset):
@@ -99,13 +105,6 @@ class BaseDataset(Dataset):
         self.videos_root = data_root / "videos"
         self.latents_root = data_root / self.latents_dir_name
 
-        # Uniform pointmap for conditioning image padding
-        train_res = self.trainer.args.train_resolution
-        uniform_pm = torch.from_numpy(
-            generate_uniform_pointmap(train_res[1], train_res[2])
-        ).permute(2, 0, 1)  # [3, H, W]
-        self.uniform_pointmap = uniform_pm * 2 - 1  # → [-1, 1]
-
         # Validate that all required latent files exist
         missing = []
         for clip in self.clips:
@@ -160,22 +159,29 @@ class BaseDataset(Dataset):
         encoded_video = encoded_video[:, :num_frames, :, :]
         encoded_pm = encoded_pm[:, :num_frames, :, :]
 
+        # !!! TEMP HACK (MEMORY DEBUG): force 13 latent frames like refer !!!
+        # This intentionally changes training behavior to reduce memory usage.
+        _num_frames = num_frames
+        if num_frames <= HACK_FORCE_LATENT_FRAMES:
+            _num_frames = num_frames
+        else:
+            _num_frames = HACK_FORCE_LATENT_FRAMES
+        encoded_video = encoded_video[:, :HACK_FORCE_LATENT_FRAMES, :, :]
+        encoded_pm = encoded_pm[:, :HACK_FORCE_LATENT_FRAMES, :, :]
+
         # ---- XYZ training normalisation ----
         encoded_pm = (encoded_pm - ENCODED_PM_MEAN) / ENCODED_PM_STD
 
-        # ---- Concatenate RGB + XYZ latents along width (last dim) ----
-        encoded_video = torch.cat([encoded_video, encoded_pm], dim=-1)
-
-        # ---- Conditioning image (first frame + uniform pointmap) ----
+        # ---- Conditioning image (first frame RGB only — XYZ gets no condition per One4D) ----
         first_frame_path = vid_dir / "first_frame.png"
         _, image = self.preprocess(None, first_frame_path)
         image = self.image_transform(image)
-        image = torch.cat([image, self.uniform_pointmap], dim=-1)
 
         return {
             "image": image,
             "prompt_embedding": prompt_embedding,
-            "encoded_video": encoded_video,
+            "encoded_video_rgb": encoded_video,
+            "encoded_video_xyz": encoded_pm,
             "image_embedding": image_embedding,
             "video_metadata": {
                 "num_frames": encoded_video.shape[1],

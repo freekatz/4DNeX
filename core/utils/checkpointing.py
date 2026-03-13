@@ -14,7 +14,7 @@ logger = get_logger(LOG_NAME, LOG_LEVEL)
 
 def get_latest_ckpt_path_to_resume_from(
     resume_from_checkpoint: str | None, num_update_steps_per_epoch: int
-) -> Tuple[str | None, int, int, int]:
+) -> Tuple[Path | None, int, int, int]:
     if resume_from_checkpoint is None:
         initial_global_step = 0
         global_step = 0
@@ -23,11 +23,10 @@ def get_latest_ckpt_path_to_resume_from(
     else:
         resume_from_checkpoint_path = Path(resume_from_checkpoint)
         if not resume_from_checkpoint_path.exists():
-            logger.info(f"Checkpoint '{resume_from_checkpoint}' does not exist. Starting a new training run.")
-            initial_global_step = 0
-            global_step = 0
-            first_epoch = 0
-            resume_from_checkpoint_path = None
+            raise FileNotFoundError(
+                f"Checkpoint path does not exist: {resume_from_checkpoint}. "
+                "Please provide a valid step directory like training/.../checkpoints/step-000800"
+            )
         else:
             logger.info(f"Resuming from checkpoint {resume_from_checkpoint}")
             global_step = int(resume_from_checkpoint_path.name.split("-")[1])
@@ -38,19 +37,27 @@ def get_latest_ckpt_path_to_resume_from(
     return resume_from_checkpoint_path, initial_global_step, global_step, first_epoch
 
 
-def get_intermediate_ckpt_path(checkpointing_limit: int, step: int, output_dir: str) -> str:
+def get_intermediate_ckpt_path(checkpointing_limit: int, step: int, output_dir: str, cleanup: bool = True) -> str:
     # before saving state, check if this save would set us over the `checkpointing_limit`
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    if checkpointing_limit is not None:
+    if cleanup and checkpointing_limit is not None:
         checkpoints = find_files(ckpt_dir, prefix="step-")
+        checkpoint_names = [Path(c).name for c in checkpoints]
+        logger.info(
+            f"Checkpoint pre-save at step {step}: existing={checkpoint_names}, limit={checkpointing_limit}"
+        )
 
         # before we save the new checkpoint, we need to have at_most `checkpoints_total_limit - 1` checkpoints
         if len(checkpoints) >= checkpointing_limit:
             num_to_remove = len(checkpoints) - checkpointing_limit + 1
             checkpoints_to_remove = checkpoints[0:num_to_remove]
+            remove_names = [Path(c).name for c in checkpoints_to_remove]
+            logger.info(f"Checkpoint pre-save at step {step}: deleting={remove_names}")
             delete_files(checkpoints_to_remove)
+        else:
+            logger.info(f"Checkpoint pre-save at step {step}: deleting=[]")
 
     logger.info(f"Checkpointing at step {step}")
     save_path = os.path.join(ckpt_dir, f"step-{step:06d}")

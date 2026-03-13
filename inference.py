@@ -1,20 +1,37 @@
-"""inference script: generate RGB video + XYZ pointmap from a single image."""
+"""inference script: generate RGB video + XYZ pointmap from a single image.
+
+Loads the One4D dual-branch pipeline (WanTransformer3DModelDualBranch + LoRA) once,
+then generates dual RGB + XYZ latents for each input sample.
+"""
 
 import argparse
+import gc
 import hashlib
+import logging
 import os
 import pickle
+import datetime
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import imageio
 import numpy as np
 import torch
+from PIL import Image
+from transformers import CLIPVisionModel
+from transformers import AutoTokenizer, CLIPImageProcessor, UMT5EncoderModel
+from diffusers.utils.loading_utils import load_image
+from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from peft import LoraConfig, set_peft_model_state_dict
 
-from core.inference.pipeline import generate_video
+from core.models.wan import WanTransformer3DModelDualBranch
+from core.models.wan_pipeline import WanDualBranchPipeline
 from core.datasets.dataclass import Pointmap
 from core.datasets.dataset import ENCODED_PM_MEAN, ENCODED_PM_STD
-from core.inference.tokenizer import WanTokenizer
+from core.models.wan_tokenizer import WanTokenizer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def decode_and_save(latents, tokenizer, save_path, mode='rgb', fps=24):
@@ -29,7 +46,7 @@ def decode_and_save(latents, tokenizer, save_path, mode='rgb', fps=24):
     Returns:
         frames: [F, H, W, 3] numpy array. RGB in [0, 1]; XYZ in original scale.
     """
-    latents = latents[None]  # Add batch dim → [1, 16, F, H, W]
+    latents = latents[None]  # Add batch dim -> [1, 16, F, H, W]
 
     if mode == 'xyz':
         # Apply dataset-specific denormalization for XYZ before VAE decode
@@ -79,12 +96,12 @@ def save_pointmap(xyz_frames, rgb_frames, save_path):
         pickle.dump(pm, f)
 
 
-def get_latent_cache_path(cache_dir, index, prompt, image_path, args):
+def get_latent_cache_path(cache_dir, index, prompt, image_path, args, weights_path):
     cache_key_raw = (
         f"idx={index}|prompt={prompt}|image={image_path}|"
         f"seed={args.seed}|frames={args.num_frames}|steps={args.num_inference_steps}|"
         f"cfg={args.guidance_scale}|h={args.height}|w={args.width}|"
-        f"rank={args.rank}|alpha={args.lora_alpha}|weights={args.weights_path}"
+        f"rank={args.rank}|weights={weights_path}"
     )
     cache_key = hashlib.sha1(cache_key_raw.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"{index:05d}_{cache_key}.pt")
@@ -101,15 +118,15 @@ def save_latent_cache(cache_path, latents_rgb, latents_xyz, meta):
 
 
 def load_latent_cache(cache_path):
-    payload = torch.load(cache_path, map_location="cpu")
+    payload = torch.load(cache_path, map_location="cpu", weights_only=True)
     if isinstance(payload, dict) and "latents_rgb" in payload and "latents_xyz" in payload:
         return payload["latents_rgb"], payload["latents_xyz"], payload.get("meta", {})
     raise ValueError(f"Invalid latent cache format: {cache_path}")
 
 
 def load_list(path_or_value):
-    """Load a list from a file (one item per line) or treat as a single value."""
-    if os.path.isfile(path_or_value):
+    """Load a list from a .txt file (one item per line) or treat as a single value."""
+    if os.path.isfile(path_or_value) and path_or_value.lower().endswith('.txt'):
         with open(path_or_value, 'r') as f:
             return [line.strip() for line in f if line.strip()]
     return [path_or_value]
@@ -149,7 +166,187 @@ def load_from_clip_dir(clip_dir):
     return prompt_list, image_list
 
 
+def resolve_weights_path(args):
+    """Resolve adapter/checkpoint directory for inference weights.
+
+    Priority:
+    1) --weights_path (recommended for training artifacts)
+    2) --lora_path (backward compatible)
+    """
+    if args.weights_path:
+        return args.weights_path
+    if args.lora_path:
+        return args.lora_path
+    raise ValueError("Provide --weights_path (recommended) or --lora_path")
+
+
+def resolve_output_dir(base_out: str) -> str:
+    """Create a run-unique output directory by appending a timestamp suffix."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base_out, f"result-{ts}")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline loading & inference
+# ---------------------------------------------------------------------------
+
+def load_pipeline(model_path, lora_path, lora_rank, zcl_layers, offload_mode, dtype=torch.bfloat16):
+    """Load the inference pipeline once.
+
+    Returns a ready-to-call pipeline with LoRA weights fused and offload configured.
+    """
+    logger.info("Loading tokenizer/text encoder/image processor...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=torch.float32)
+    image_processor = CLIPImageProcessor.from_pretrained(model_path, subfolder="image_processor")
+
+    logger.info("Loading image encoder...")
+    image_encoder = CLIPVisionModel.from_pretrained(
+        model_path, subfolder="image_encoder", torch_dtype=torch.float32,
+    )
+
+    logger.info("Loading VAE + scheduler...")
+    vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae", torch_dtype=dtype)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
+
+    logger.info("Loading transformer (WanTransformer3DModelDualBranch)...")
+    transformer = WanTransformer3DModelDualBranch.from_pretrained(
+        model_path, subfolder="transformer", torch_dtype=dtype, zcl_layers=tuple(zcl_layers),
+    )
+
+    logger.info("Building pipeline...")
+    pipe = WanDualBranchPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        image_encoder=image_encoder,
+        image_processor=image_processor,
+        transformer=transformer,
+        vae=vae,
+        scheduler=scheduler,
+    )
+
+    # Load dual modality-specific LoRA adapters (rgb/xyz)
+    lora_adapters_file = os.path.join(lora_path, "lora_adapters.pt")
+    if os.path.exists(lora_adapters_file):
+        logger.info(f"Loading dual LoRA adapters from {lora_adapters_file}")
+        lora_payload = torch.load(lora_adapters_file, map_location="cpu", weights_only=True)
+        adapters_state = lora_payload.get("adapters", {})
+        peft_config = lora_payload.get("peft_config")
+
+        if peft_config is None:
+            peft_config = {
+                "r": lora_rank,
+                "lora_alpha": max(1, lora_rank // 2),
+                "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+                "init_lora_weights": True,
+            }
+
+        lora_cfg = LoraConfig(**peft_config)
+        transformer.add_adapter(lora_cfg, adapter_name="rgb")
+        transformer.add_adapter(lora_cfg, adapter_name="xyz")
+
+        for adapter_name in ("rgb", "xyz"):
+            if adapter_name not in adapters_state:
+                raise KeyError(f"Adapter '{adapter_name}' not found in {lora_adapters_file}")
+            set_peft_model_state_dict(transformer, adapters_state[adapter_name], adapter_name=adapter_name)
+
+        if hasattr(transformer, "set_adapter"):
+            transformer.set_adapter("rgb")
+
+        logger.info("Dual LoRA adapters loaded (no fuse; branch adapter switched inside model forward)")
+    else:
+        logger.warning(f"lora_adapters.pt not found at {lora_path}; running without trained LoRA adapters")
+
+    # Load ZCL control-link weights (trained bidirectional cross-modal links)
+    zcl_file = os.path.join(lora_path, "zcl_links.pt")
+    if os.path.exists(zcl_file):
+        logger.info(f"Loading ZCL weights from {zcl_file}")
+        zcl_state = torch.load(zcl_file, map_location="cpu", weights_only=True)
+        if hasattr(transformer, "zcl_rgb_from_xyz") and "zcl_rgb_from_xyz" in zcl_state:
+            transformer.zcl_rgb_from_xyz.load_state_dict(zcl_state["zcl_rgb_from_xyz"], strict=False)
+        if hasattr(transformer, "zcl_xyz_from_rgb") and "zcl_xyz_from_rgb" in zcl_state:
+            transformer.zcl_xyz_from_rgb.load_state_dict(zcl_state["zcl_xyz_from_rgb"], strict=False)
+    else:
+        logger.warning(f"zcl_links.pt not found at {lora_path}; ZCL links remain zero-initialized")
+
+    # ZCL linears are initialized / loaded in fp32 (training dtype for trainable
+    # params), but the rest of the transformer is in `dtype` (typically bf16).
+    # Cast them to match so _apply_zcl doesn't hit a dtype mismatch.
+    if hasattr(transformer, "zcl_rgb_from_xyz"):
+        transformer.zcl_rgb_from_xyz.to(dtype=dtype)
+    if hasattr(transformer, "zcl_xyz_from_rgb"):
+        transformer.zcl_xyz_from_rgb.to(dtype=dtype)
+
+    # VAE memory optimization
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+
+    # CPU offload strategy
+    if offload_mode == "sequential":
+        pipe.enable_sequential_cpu_offload()
+        logger.info("Using sequential CPU offload (low memory, slower)")
+    elif offload_mode == "model":
+        pipe.enable_model_cpu_offload()
+        logger.info("Using model CPU offload (moderate memory, faster)")
+    elif offload_mode == "none":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pipe.to(device)
+        logger.info(f"Using no offload, pipeline on {device}")
+
+    return pipe
+
+
+def run_pipeline(pipe, prompt, image_path, num_frames, width, height,
+                 num_inference_steps, guidance_scale, seed, output_on_cpu):
+    """Run a single inference pass and return (latents_rgb, latents_xyz)."""
+    image = load_image(image=image_path)
+
+    max_area = 480 * 720
+    aspect_ratio = image.height / image.width
+    mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
+    resolved_height = int(height or (round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value))
+    resolved_width = int(width or (round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value))
+    image = image.resize((resolved_width, resolved_height))
+
+    with torch.inference_mode():
+        latents_rgb, latents_xyz = pipe(
+            height=resolved_height,
+            width=resolved_width,
+            prompt=prompt,
+            image=image,
+            num_videos_per_prompt=1,
+            num_inference_steps=num_inference_steps,
+            num_frames=num_frames,
+            guidance_scale=guidance_scale,
+            generator=torch.Generator().manual_seed(seed),
+            output_type="latent",
+            return_dict=False,
+        )
+
+    # Each latent is [B, C, F, H, W] — squeeze batch dim
+    latents_rgb = latents_rgb.squeeze(0)  # [C, F, H, W]
+    latents_xyz = latents_xyz.squeeze(0)  # [C, F, H, W]
+
+    if output_on_cpu:
+        latents_rgb = latents_rgb.cpu()
+        latents_xyz = latents_xyz.cpu()
+
+    return latents_rgb, latents_xyz
+
+
+def release_pipeline(pipe):
+    """Release pipeline VRAM so the decoder can use it."""
+    del pipe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main(args):
+    weights_path = resolve_weights_path(args)
+    run_out = resolve_output_dir(args.out)
+    print(f"[Info] Output directory: {run_out}")
+
     if args.clip_dir is not None:
         prompt_list, image_list = load_from_clip_dir(args.clip_dir)
     else:
@@ -173,12 +370,12 @@ def main(args):
     # For fastest decode on CUDA, avoid moving latents to CPU and back.
     effective_latents_on_cpu = args.latents_on_cpu
     if decode_device == 'cuda' and args.decode_fast and args.latents_on_cpu:
-        print("[Info] decode_device=cuda 且 decode_fast=true，自动设置 latents_on_cpu=false 以避免额外拷贝并加速解码")
+        print("[Info] decode_device=cuda and decode_fast=true, setting latents_on_cpu=false to avoid extra copies")
         effective_latents_on_cpu = False
 
-    latent_cache_dir = args.latent_cache_dir or os.path.join(args.out, "latent_cache")
+    latent_cache_dir = args.latent_cache_dir or os.path.join(run_out, "latent_cache")
 
-    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(run_out, exist_ok=True)
 
     # Determine which indices this process handles
     all_indices = list(range(len(prompt_list)))
@@ -188,36 +385,53 @@ def main(args):
         all_indices = [i for i in all_indices if i % args.num_shards == args.shard_id]
         print(f"[Shard {args.shard_id}/{args.num_shards}] Processing {len(all_indices)}/{len(prompt_list)} samples")
 
+    # Check if any sample needs denoising (not all cached)
+    needs_denoising = False
     for i in all_indices:
+        prompt, image_path = prompt_list[i], image_list[i]
+        prompt = prompt + ' POINTMAP_STYLE.'
+        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args, weights_path)
+        if not (args.use_latent_cache and os.path.exists(cache_path)):
+            needs_denoising = True
+            break
 
+    # Load pipeline once (only if needed)
+    pipe = None
+    if needs_denoising:
+        pipe = load_pipeline(
+            model_path=args.model_path,
+            lora_path=weights_path,
+            lora_rank=args.rank,
+            zcl_layers=args.zcl_layers,
+            offload_mode=args.offload_mode,
+            dtype=torch.bfloat16,
+        )
+
+    # Collect all latent results before decoding, so we can release the pipeline first
+    latent_results = {}
+
+    for i in all_indices:
         prompt, image_path = prompt_list[i], image_list[i]
         suffix = 'POINTMAP_STYLE.'
         prompt = prompt + ' ' + suffix
 
         print(f"[{i}/{len(prompt_list)}] Generating: {prompt[:60]}...")
 
-        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args)
-        loaded_from_cache = False
+        cache_path = get_latent_cache_path(latent_cache_dir, i, prompt, image_path, args, weights_path)
         if args.use_latent_cache and os.path.exists(cache_path):
             print(f"  Loading denoised latents from cache: {cache_path}")
             latents_rgb, latents_xyz, _ = load_latent_cache(cache_path)
-            loaded_from_cache = True
         else:
-            latents_rgb, latents_xyz = generate_video(
+            latents_rgb, latents_xyz = run_pipeline(
+                pipe=pipe,
                 prompt=prompt,
-                image_or_video_path=image_path,
-                model_path=args.model_path,
-                weights_path=args.weights_path,
+                image_path=image_path,
                 num_frames=args.num_frames,
                 width=args.width,
                 height=args.height,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
-                rank=args.rank,
-                lora_alpha=args.lora_alpha,
-                dtype=torch.bfloat16,
-                offload_mode=args.offload_mode,
                 output_on_cpu=effective_latents_on_cpu,
             )
             if args.use_latent_cache:
@@ -228,17 +442,27 @@ def main(args):
                     "guidance_scale": args.guidance_scale,
                     "height": args.height,
                     "width": args.width,
-                    "weights_path": args.weights_path,
+                    "weights_path": weights_path,
                 }
                 save_latent_cache(cache_path, latents_rgb, latents_xyz, meta)
                 print(f"  Saved denoised latents to cache: {cache_path}")
 
-        if decode_device == "cuda" and not loaded_from_cache:
-            # Ensure decode runs on GPU without extra host-device transfers.
+        latent_results[i] = (latents_rgb, latents_xyz)
+
+    # Release pipeline VRAM before decoding
+    if pipe is not None:
+        release_pipeline(pipe)
+        pipe = None
+
+    # Decode all latents
+    for i in all_indices:
+        latents_rgb, latents_xyz = latent_results[i]
+
+        if decode_device == "cuda":
             latents_rgb = latents_rgb.to("cuda")
             latents_xyz = latents_xyz.to("cuda")
 
-        # Load decoder after denoising; inference pipeline has been released in generate_video.
+        # Load decoder lazily
         if tokenizer is None:
             print(f"  Loading decode tokenizer on {decode_device}...")
             tokenizer = WanTokenizer(model_path=vae_path, device=decode_device)
@@ -249,18 +473,18 @@ def main(args):
                 print("  Decode mode: memory-safe (enable slicing/tiling)")
 
         # Decode and save RGB video
-        print("  Decoding RGB latent...")
-        rgb_path = os.path.join(args.out, f'{i:05d}_rgb.mp4')
+        print(f"  [{i}] Decoding RGB latent...")
+        rgb_path = os.path.join(run_out, f'{i:05d}_rgb.mp4')
         rgb_frames = decode_and_save(latents_rgb, tokenizer, rgb_path, mode='rgb', fps=args.fps)
 
         # Decode and save XYZ pointmap video
-        print("  Decoding XYZ latent...")
-        xyz_path = os.path.join(args.out, f'{i:05d}_xyz.mp4')
+        print(f"  [{i}] Decoding XYZ latent...")
+        xyz_path = os.path.join(run_out, f'{i:05d}_xyz.mp4')
         xyz_frames = decode_and_save(latents_xyz, tokenizer, xyz_path, mode='xyz', fps=args.fps)
 
         # Save combined pointmap
-        print("  Saving pointmap pickle...")
-        pkl_path = os.path.join(args.out, f'{i:05d}.pkl')
+        print(f"  [{i}] Saving pointmap pickle...")
+        pkl_path = os.path.join(run_out, f'{i:05d}.pkl')
         save_pointmap(xyz_frames, rgb_frames, pkl_path)
 
         print(f"  Saved: {rgb_path}, {xyz_path}, {pkl_path}")
@@ -297,10 +521,14 @@ def main(args):
                 K=K.cpu().numpy()[None].repeat(F, axis=0),
             )
 
-            opt_pkl_path = os.path.join(args.out, f'{i:05d}_optimized.pkl')
+            opt_pkl_path = os.path.join(run_out, f'{i:05d}_optimized.pkl')
             with open(opt_pkl_path, 'wb') as f:
                 pickle.dump(pm, f)
             print(f"  Saved optimized: {opt_pkl_path}")
+
+        # Free decoded frames
+        del latents_rgb, latents_xyz
+    del latent_results
 
 
 if __name__ == "__main__":
@@ -315,9 +543,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
     parser.add_argument("--model_path", type=str, default="pretrained/Wan2.1-I2V-14B-480P-Diffusers",
                         help="Path to pretrained Wan model")
-    parser.add_argument("--weights_path", type=str, required=True,
-                        help="Path to trained weights (dir or .safetensors file)")
-    parser.add_argument("--out", type=str, default="results", help="Output directory")
+    parser.add_argument("--weights_path", type=str, default=None,
+                        help="Path to training checkpoint/adapter directory (recommended, e.g. training/checkpoints/step-000010)")
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="Backward-compatible alias of --weights_path")
+    parser.add_argument("--out", type=str, default="results", help="Output directory prefix; timestamp suffix will be auto-appended")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
     parser.add_argument("--width", type=int, default=None, help="Output video width (must match model constraints)")
@@ -326,7 +556,12 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--rank", type=int, default=64, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument(
+        "--zcl_layers",
+        type=str,
+        default="3,11,19,27,35",
+        help="Comma-separated DiT block indices for ZCL, e.g. 3,11,19,27,35",
+    )
     parser.add_argument("--offload_mode", type=str, default="model",
                         choices=["model", "sequential", "none"],
                         help="CPU offload strategy: "
@@ -348,4 +583,5 @@ if __name__ == "__main__":
     parser.add_argument("--opt_iters", type=int, default=1500,
                         help="Number of optimization iterations")
     args = parser.parse_args()
+    args.zcl_layers = [int(x.strip()) for x in args.zcl_layers.split(",") if x.strip()]
     main(args)

@@ -118,6 +118,7 @@ accelerate launch \
     --report_to all \
     --rank 64 \
     --lora_alpha 32 \
+    --zcl_layers 3,11,19,27,35 \
     --data_root ./data \
     --train_resolution 81x480x720 \
     --train_epochs 10 \

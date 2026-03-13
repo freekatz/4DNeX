@@ -1,10 +1,10 @@
-from core.models.trainer import WanDualTrainer
+from core.models.wan_trainer import WanTrainer
 from core.schemas import Args
 
 
 def main():
     args = Args.parse_args()
-    trainer = WanDualTrainer(args)
+    trainer = WanTrainer(args)
     trainer.fit()
 
 

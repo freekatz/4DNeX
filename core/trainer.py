@@ -225,10 +225,15 @@ class Trainer:
                 init_lora_weights=True,
                 target_modules=self.args.target_modules,
             )
-            self.components.transformer.add_adapter(transformer_lora_config)
-            self.__prepare_saving_loading_hooks(transformer_lora_config)
+            # DLC-style dual LoRA branches: one adapter per modality branch.
+            self.components.transformer.add_adapter(transformer_lora_config, adapter_name="rgb")
+            self.components.transformer.add_adapter(transformer_lora_config, adapter_name="xyz")
+            if hasattr(self.components.transformer, "set_adapter"):
+                self.components.transformer.set_adapter("rgb")
+
+            self.__prepare_saving_loading_hooks(transformer_lora_config, adapter_names=("rgb", "xyz"))
             for name, param in self.components.transformer.named_parameters():
-                if 'learnable_domain_embeddings' in name:
+                if 'zcl_' in name or 'lora_' in name:
                     param.requires_grad_(True)
                     logger.info(f"Training {name} after adding LoRA")
 
@@ -306,6 +311,22 @@ class Trainer:
         self.lr_scheduler = lr_scheduler
 
     def prepare_for_training(self) -> None:
+        # Fail fast if any parameter is still on meta device. This usually means
+        # the model was loaded with low_cpu_mem_usage/meta init while introducing
+        # new parameters not present in checkpoint (e.g., One4D zcl_*).
+        meta_params = [
+            name
+            for name, p in self.components.transformer.named_parameters()
+            if getattr(p, "is_meta", False)
+        ]
+        if meta_params:
+            preview = ", ".join(meta_params[:8])
+            raise RuntimeError(
+                "Transformer has meta parameters before accelerator.prepare(). "
+                f"Count={len(meta_params)}; examples: {preview}. "
+                "Reload transformer with low_cpu_mem_usage=False so new params are materialized."
+            )
+
         self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
             self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler
         )
@@ -385,7 +406,8 @@ class Trainer:
             f"  README.md            # This file\n"
             f"  checkpoints/         # Model checkpoints (step-NNNNNN/)\n"
             f"    step-NNNNNN/\n"
-            f"      weights.safetensors  # LoRA + DLC + patch_embedding_xyz\n"
+            f"      lora_adapters.pt                  # LoRA adapter weights (rgb/xyz)\n"
+            f"      zcl_links.pt                      # ZCL control-link parameters\n"
             f"      optimizer.bin        # Optimizer state\n"
             f"      scheduler.bin        # LR scheduler state\n"
             f"      random_states_*.pkl  # RNG states for reproducibility\n"
@@ -432,7 +454,7 @@ class Trainer:
         banner = (
             "\n"
             "══════════════════════════════════════════════════════════\n"
-            "  One4D Training\n"
+            "  Training\n"
             f"  Model: {self.args.model_path.name} | {self.args.training_type} rank={self.args.rank}\n"
             f"  Resolution: {res[0]}x{res[1]}x{res[2]}\n"
             f"  Params: {trainable:,} trainable / {total_params:,} total ({pct:.2f}%)\n"
@@ -477,13 +499,21 @@ class Trainer:
 
         free_memory()
         ema_loss = None
+        ema_loss_rgb = None
+        ema_loss_xyz = None
         ema_beta = 0.95
+        training_start_time = time.monotonic()
         for epoch in range(first_epoch, self.args.train_epochs):
             logger.debug(f"Starting epoch ({epoch + 1}/{self.args.train_epochs})")
 
             self.components.transformer.train()
             models_to_accumulate = [self.components.transformer]
             last_step_end_monotonic = time.monotonic()
+            epoch_loss_sum = 0.0
+            epoch_loss_rgb_sum = 0.0
+            epoch_loss_xyz_sum = 0.0
+            epoch_step_count = 0
+            epoch_start_time = time.monotonic()
 
             for step, batch in enumerate(self.data_loader):
                 logger.debug(f"Starting step {step + 1}")
@@ -558,25 +588,36 @@ class Trainer:
                 if "grad_norm" in logs:
                     logs["optim/grad_norm"] = float(logs["grad_norm"])
 
-                for key in ["optim/grad_norm_rgb_lora", "optim/grad_norm_xyz_lora", "optim/grad_norm_dlc"]:
+                for key in ["optim/grad_norm_lora", "optim/grad_norm_domain_emb", "optim/grad_norm_zcl"]:
                     if key in logs:
                         logs[key] = float(logs[key])
 
                 if self.state.latest_loss_metrics:
-                    one4d_metric_keys = [
-                        "loss_rgb",
-                        "loss_xyz",
-                        "loss_ratio_rgb",
-                        "loss_ratio_xyz",
-                        "loss_gap_abs",
-                        "loss_gap_rel",
-                        "dlc_coupling_rgb",
-                        "dlc_coupling_xyz",
-                        "dlc_balance_gap",
-                    ]
-                    for metric_key in one4d_metric_keys:
-                        if metric_key in self.state.latest_loss_metrics:
-                            logs[f"train/{metric_key}"] = float(self.state.latest_loss_metrics[metric_key])
+                    for metric_key, val in self.state.latest_loss_metrics.items():
+                        logs[f"train/{metric_key}"] = float(val)
+
+                # Per-branch EMA and loss ratio
+                if self.state.latest_loss_metrics:
+                    _rgb = self.state.latest_loss_metrics.get("loss_rgb")
+                    _xyz = self.state.latest_loss_metrics.get("loss_xyz")
+                    if _rgb is not None:
+                        ema_loss_rgb = _rgb if ema_loss_rgb is None else ema_beta * ema_loss_rgb + (1 - ema_beta) * _rgb
+                        logs["train/loss_rgb_ema"] = float(ema_loss_rgb)
+                    if _xyz is not None:
+                        ema_loss_xyz = _xyz if ema_loss_xyz is None else ema_beta * ema_loss_xyz + (1 - ema_beta) * _xyz
+                        logs["train/loss_xyz_ema"] = float(ema_loss_xyz)
+                    if _rgb is not None and _xyz is not None and _xyz > 0:
+                        logs["train/loss_ratio_rgb_xyz"] = float(_rgb / _xyz)
+                    epoch_loss_rgb_sum += _rgb if _rgb is not None else 0.0
+                    epoch_loss_xyz_sum += _xyz if _xyz is not None else 0.0
+
+                # NaN/Inf check
+                if not math.isfinite(loss_scalar):
+                    logger.warning(f"[Step {global_step}] Non-finite loss detected: {loss_scalar}")
+
+                # Epoch accumulation
+                epoch_loss_sum += loss_scalar
+                epoch_step_count += 1
 
                 if torch.cuda.is_available() and accelerator.device.type == "cuda":
                     mem_alloc = torch.cuda.memory_allocated(accelerator.device) / (1024**3)
@@ -608,19 +649,15 @@ class Trainer:
                     logs.update(lora_norms)
 
                 _mem_str = f"{mem_alloc:.1f}" if torch.cuda.is_available() and accelerator.device.type == "cuda" else "n/a"
+                _loss_rgb = self.state.latest_loss_metrics.get("loss_rgb", 0.0)
+                _loss_xyz = self.state.latest_loss_metrics.get("loss_xyz", 0.0)
                 progress_bar.set_postfix(
                     {
                         "epoch": f"{epoch+1}/{self.args.train_epochs}",
                         "loss": f"{loss_scalar:.4f}",
-                        "rgb": (
-                            f"{logs['train/loss_rgb']:.4f}" if "train/loss_rgb" in logs else "n/a"
-                        ),
-                        "xyz": (
-                            f"{logs['train/loss_xyz']:.4f}" if "train/loss_xyz" in logs else "n/a"
-                        ),
-                        "ratio": (
-                            f"{logs['train/loss_ratio_rgb']:.2f}" if "train/loss_ratio_rgb" in logs else "n/a"
-                        ),
+                        "rgb": f"{_loss_rgb:.4f}",
+                        "xyz": f"{_loss_xyz:.4f}",
+                        "ema": f"{ema_loss:.4f}",
                         "lr": f"{logs['lr']:.1e}",
                         "grad": f"{logs['grad_norm']:.2f}" if "grad_norm" in logs else "n/a",
                         "s/it": f"{step_time_sec:.1f}",
@@ -632,21 +669,17 @@ class Trainer:
                 if accelerator.is_main_process and accelerator.sync_gradients and global_step % 10 == 0:
                     _r = lambda k, d=0.0: round(float(logs.get(k, d)), 4)
                     _mem = f" mem={mem_alloc:.1f}G" if torch.cuda.is_available() and accelerator.device.type == "cuda" else ""
-                    _gap_pct = f"{_r('train/loss_gap_rel') * 100:.1f}%"
                     console_line = (
                         f"[Step {global_step}/{self.args.train_steps}] "
-                        f"loss={loss_scalar:.4f} ema={ema_loss:.4f} | "
-                        f"rgb={_r('train/loss_rgb'):.4f} xyz={_r('train/loss_xyz'):.4f} "
-                        f"ratio={_r('train/loss_ratio_rgb'):.2f}/{_r('train/loss_ratio_xyz'):.2f} gap={_gap_pct} | "
-                        f"dlc={_r('train/dlc_coupling_rgb'):.3f}/{_r('train/dlc_coupling_xyz'):.3f} | "
+                        f"loss={loss_scalar:.4f} ema={ema_loss:.4f} "
+                        f"(rgb={_loss_rgb:.4f} xyz={_loss_xyz:.4f}) | "
                         f"lr={logs.get('lr', 0):.1e} "
                         f"grad={_r('optim/grad_norm'):.2f} "
-                        f"(rgb={_r('optim/grad_norm_rgb_lora'):.2f} xyz={_r('optim/grad_norm_xyz_lora'):.2f} dlc={_r('optim/grad_norm_dlc'):.3f}) | "
+                        f"(lora={_r('optim/grad_norm_lora'):.2f} zcl={_r('optim/grad_norm_zcl'):.3f}) | "
                         f"{step_time_sec:.1f}s/it{_mem}"
                     )
                     logger.info(console_line)
-                    # Also keep JSON for machine parsing at debug level
-                    logger.debug(f"One4D metrics: {json.dumps({k: v for k, v in logs.items() if k.startswith(('train/', 'optim/'))}, ensure_ascii=True)}")
+                    logger.debug(f"Metrics: {json.dumps({k: v for k, v in logs.items() if k.startswith(('train/', 'optim/'))}, ensure_ascii=True)}")
 
                 # Maybe run validation
                 should_run_validation = self.args.do_validation and global_step % self.args.validation_steps == 0
@@ -665,11 +698,36 @@ class Trainer:
             memory_statistics = get_memory_statistics()
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
+            # Epoch summary
+            epoch_elapsed = time.monotonic() - epoch_start_time
+            if epoch_step_count > 0:
+                epoch_summary = (
+                    f"Epoch {epoch+1}/{self.args.train_epochs} complete | "
+                    f"avg_loss={epoch_loss_sum/epoch_step_count:.4f} "
+                    f"(rgb={epoch_loss_rgb_sum/epoch_step_count:.4f} xyz={epoch_loss_xyz_sum/epoch_step_count:.4f}) | "
+                    f"{epoch_step_count} steps in {epoch_elapsed:.0f}s ({epoch_step_count/epoch_elapsed:.1f} it/s)"
+                )
+                logger.info(epoch_summary)
+
         accelerator.wait_for_everyone()
         self.__maybe_save_checkpoint(global_step, must_save=True)
         if self.args.do_validation:
             free_memory()
             self.validate(global_step)
+
+        # Training complete summary
+        training_elapsed = time.monotonic() - training_start_time
+        avg_speed = global_step / training_elapsed if training_elapsed > 0 else 0.0
+        summary_banner = (
+            "\n"
+            "══════════════════════════════════════════════════════════\n"
+            "  Training Complete\n"
+            f"  Final loss: {ema_loss:.4f} (EMA)\n"
+            f"  Steps: {global_step} | Elapsed: {training_elapsed:.0f}s\n"
+            f"  Avg speed: {avg_speed:.2f} it/s\n"
+            "══════════════════════════════════════════════════════════"
+        )
+        logger.info(summary_banner)
 
         del self.components
         free_memory()
@@ -879,12 +937,11 @@ class Trainer:
             raise ValueError(f"Invalid mixed precision: {self.args.mixed_precision}")
 
     def __compute_one4d_branch_grad_norms(self) -> Dict[str, float]:
-        """Compute grouped grad norms for One4D trainable groups.
+        """Compute grouped grad norms for trainable parameter groups.
 
         Groups:
-        - RGB LoRA adapter params
-        - XYZ LoRA adapter params
-        - DLC params
+        - LoRA adapter params
+        - ZCL control links
         """
         try:
             model = unwrap_model(self.accelerator, self.components.transformer)
@@ -892,9 +949,8 @@ class Trainer:
             return {}
 
         group_sum_sq = {
-            "rgb_lora": 0.0,
-            "xyz_lora": 0.0,
-            "dlc": 0.0,
+            "lora": 0.0,
+            "zcl": 0.0,
         }
 
         for name, param in model.named_parameters():
@@ -903,17 +959,10 @@ class Trainer:
             name_lower = name.lower()
             grad_sq = float(torch.sum(param.grad.detach().float() ** 2).item())
 
-            if "dlc_" in name_lower:
-                group_sum_sq["dlc"] += grad_sq
-                continue
-
-            if "lora" not in name_lower:
-                continue
-
-            if "rgb" in name_lower:
-                group_sum_sq["rgb_lora"] += grad_sq
-            elif "xyz" in name_lower:
-                group_sum_sq["xyz_lora"] += grad_sq
+            if "zcl_" in name_lower:
+                group_sum_sq["zcl"] += grad_sq
+            elif "lora" in name_lower:
+                group_sum_sq["lora"] += grad_sq
 
         grad_metrics: Dict[str, float] = {}
         for key, sum_sq in group_sum_sq.items():
@@ -923,13 +972,13 @@ class Trainer:
         return grad_metrics
 
     def __compute_lora_weight_norms(self) -> Dict[str, float]:
-        """Compute L2 norms of LoRA adapter weights (how far they've moved from init)."""
+        """Compute L2 norms of trainable weights (how far they've moved from init)."""
         try:
             model = unwrap_model(self.accelerator, self.components.transformer)
         except Exception:
             return {}
 
-        group_sum_sq = {"rgb_lora": 0.0, "xyz_lora": 0.0, "dlc": 0.0}
+        group_sum_sq = {"lora": 0.0, "zcl": 0.0}
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -937,13 +986,10 @@ class Trainer:
             name_lower = name.lower()
             w_sq = float(torch.sum(param.detach().float() ** 2).item())
 
-            if "dlc_" in name_lower:
-                group_sum_sq["dlc"] += w_sq
+            if "zcl_" in name_lower:
+                group_sum_sq["zcl"] += w_sq
             elif "lora" in name_lower:
-                if "rgb" in name_lower:
-                    group_sum_sq["rgb_lora"] += w_sq
-                elif "xyz" in name_lower:
-                    group_sum_sq["xyz_lora"] += w_sq
+                group_sum_sq["lora"] += w_sq
 
         norms: Dict[str, float] = {}
         for key, sum_sq in group_sum_sq.items():
@@ -967,11 +1013,12 @@ class Trainer:
                 if name in unload_list:
                     setattr(self.components, name, component.to("cpu"))
 
-    def __prepare_saving_loading_hooks(self, transformer_lora_config):
+    def __prepare_saving_loading_hooks(self, transformer_lora_config, adapter_names=("rgb", "xyz")):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
-                transformer_lora_layers_to_save = None
+                lora_adapters_state = {}
+                peft_config = None
 
                 for model in models:
                     if isinstance(
@@ -979,7 +1026,20 @@ class Trainer:
                         type(unwrap_model(self.accelerator, self.components.transformer)),
                     ):
                         model = unwrap_model(self.accelerator, model)
-                        transformer_lora_layers_to_save = get_peft_model_state_dict(model)
+                        for adapter_name in adapter_names:
+                            lora_adapters_state[adapter_name] = get_peft_model_state_dict(
+                                model, adapter_name=adapter_name
+                            )
+
+                        if hasattr(model, "peft_config") and adapter_names[0] in model.peft_config:
+                            peft_config = model.peft_config[adapter_names[0]].to_dict()
+                            # Sanitize for weights_only=True compatibility:
+                            # PeftType enum -> str, set -> sorted list.
+                            for _k, _v in peft_config.items():
+                                if isinstance(_v, set):
+                                    peft_config[_k] = sorted(_v)
+                                elif hasattr(_v, "value"):
+                                    peft_config[_k] = _v.value
                     else:
                         raise ValueError(f"Unexpected save model: {model.__class__}")
 
@@ -987,22 +1047,24 @@ class Trainer:
                     if weights:
                         weights.pop()
 
-                self.components.pipeline_cls.save_lora_weights(
-                    output_dir,
-                    transformer_lora_layers=transformer_lora_layers_to_save,
+                torch.save(
+                    {
+                        "adapters": lora_adapters_state,
+                        "peft_config": peft_config,
+                        "adapter_names": list(adapter_names),
+                    },
+                    os.path.join(output_dir, "lora_adapters.pt"),
                 )
 
-                # Save extra trainable parameters (e.g. learnable_domain_embeddings)
                 model = unwrap_model(self.accelerator, self.components.transformer)
-                extra_state = {
-                    k: v for k, v in model.state_dict().items()
-                    if 'learnable_domain_embeddings' in k
-                }
-                if extra_state:
-                    torch.save(
-                        extra_state,
-                        os.path.join(output_dir, "learnable_domain_embeddings.pt"),
-                    )
+
+                # Save ZCL control-link parameters if present
+                zcl_state = {
+                    "zcl_rgb_from_xyz": model.zcl_rgb_from_xyz.state_dict(),
+                    "zcl_xyz_from_rgb": model.zcl_xyz_from_rgb.state_dict(),
+                } if hasattr(model, "zcl_rgb_from_xyz") and hasattr(model, "zcl_xyz_from_rgb") else None
+                if zcl_state is not None:
+                    torch.save(zcl_state, os.path.join(output_dir, "zcl_links.pt"))
 
         def load_model_hook(models, input_dir):
             if not self.accelerator.distributed_type == DistributedType.DEEPSPEED:
@@ -1017,25 +1079,44 @@ class Trainer:
                         raise ValueError(f"Unexpected save model: {unwrap_model(self.accelerator, model).__class__}")
             else:
                 transformer_ = unwrap_model(self.accelerator, self.components.transformer).__class__.from_pretrained(
-                    self.args.model_path, subfolder="transformer"
+                    self.args.model_path,
+                    subfolder="transformer",
+                    zcl_layers=tuple(self.args.zcl_layers),
                 )
-                transformer_.add_adapter(transformer_lora_config)
+                for adapter_name in adapter_names:
+                    transformer_.add_adapter(transformer_lora_config, adapter_name=adapter_name)
 
-            lora_state_dict = self.components.pipeline_cls.lora_state_dict(input_dir)
-            transformer_state_dict = {
-                f'{k.replace("transformer.", "")}': v
-                for k, v in lora_state_dict.items()
-                if k.startswith("transformer.")
-            }
-            incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
-            if incompatible_keys is not None:
-                # check only for unexpected keys
-                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                if unexpected_keys:
-                    logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
-                    )
+            lora_adapters_path = os.path.join(input_dir, "lora_adapters.pt")
+            if not os.path.exists(lora_adapters_path):
+                raise FileNotFoundError(f"Missing lora_adapters.pt in checkpoint: {input_dir}")
+
+            lora_payload = torch.load(lora_adapters_path, map_location="cpu", weights_only=True)
+            adapters_state = lora_payload.get("adapters", {})
+            for adapter_name in adapter_names:
+                if adapter_name not in adapters_state:
+                    raise KeyError(f"Adapter '{adapter_name}' not found in lora_adapters.pt")
+                incompatible_keys = set_peft_model_state_dict(
+                    transformer_, adapters_state[adapter_name], adapter_name=adapter_name
+                )
+                if incompatible_keys is not None:
+                    unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                    if unexpected_keys:
+                        logger.warning(
+                            f"Loading adapter '{adapter_name}' led to unexpected keys not found in the model: "
+                            f" {unexpected_keys}. "
+                        )
+
+            if hasattr(transformer_, "set_adapter"):
+                transformer_.set_adapter("rgb")
+
+            # Load ZCL control-link parameters if present
+            zcl_path = os.path.join(input_dir, "zcl_links.pt")
+            if os.path.exists(zcl_path):
+                zcl_state = torch.load(zcl_path, map_location="cpu", weights_only=True)
+                if hasattr(transformer_, "zcl_rgb_from_xyz") and "zcl_rgb_from_xyz" in zcl_state:
+                    transformer_.zcl_rgb_from_xyz.load_state_dict(zcl_state["zcl_rgb_from_xyz"], strict=False)
+                if hasattr(transformer_, "zcl_xyz_from_rgb") and "zcl_xyz_from_rgb" in zcl_state:
+                    transformer_.zcl_xyz_from_rgb.load_state_dict(zcl_state["zcl_xyz_from_rgb"], strict=False)
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1048,5 +1129,9 @@ class Trainer:
                     checkpointing_limit=self.args.checkpointing_limit,
                     step=global_step,
                     output_dir=self.args.output_dir,
+                    cleanup=self.accelerator.is_main_process,
                 )
+                # In distributed runs (especially DeepSpeed), keep checkpoint pruning
+                # on main process only and sync before all ranks write shards.
+                self.accelerator.wait_for_everyone()
                 self.accelerator.save_state(save_path, safe_serialization=True)

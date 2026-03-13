@@ -14,6 +14,9 @@ Usage examples::
     # Filter by source dataset
     python make_subset_index.py --index data/index.json --source 4dnex --output data/index_4dnex.json
 
+    # Filter by source, then random sample 200 clips
+    python make_subset_index.py --index data/index.json --source omniworld_hoi4d -n 200 --seed 42 --strategy random --output data/index_overfit_hoi4d_200.json
+
 Then train with::
 
     accelerate launch ... finetune.py --data_root data --index_file data/index_overfit.json ...
@@ -34,7 +37,8 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-n", type=int, help="Number of clips to sample")
     group.add_argument("--pick", type=int, nargs="+", help="Specific clip indices (0-based) to select")
-    group.add_argument("--source", type=str, help="Keep only clips from this source_dataset")
+
+    parser.add_argument("--source", type=str, default=None, help="Filter clips by source before selection")
 
     parser.add_argument(
         "--strategy", choices=["random", "first"], default="random",
@@ -50,19 +54,23 @@ def main() -> None:
     clips = index["clips"]
     total = len(clips)
 
+    # Optional pre-filter by source_dataset.
+    if args.source is not None:
+        clips = [c for c in clips if c.get("source") == args.source]
+        if not clips:
+            print(f"Error: no clips found with source='{args.source}'", file=sys.stderr)
+            sys.exit(1)
+
+    filtered_total = len(clips)
+
     if args.pick is not None:
-        bad = [i for i in args.pick if i < 0 or i >= total]
+        bad = [i for i in args.pick if i < 0 or i >= filtered_total]
         if bad:
-            print(f"Error: indices out of range (total {total}): {bad}", file=sys.stderr)
+            print(f"Error: indices out of range (total {filtered_total}): {bad}", file=sys.stderr)
             sys.exit(1)
         subset = [clips[i] for i in args.pick]
-    elif args.source is not None:
-        subset = [c for c in clips if c.get("source_dataset") == args.source]
-        if not subset:
-            print(f"Error: no clips found with source_dataset='{args.source}'", file=sys.stderr)
-            sys.exit(1)
     else:
-        n = min(args.n, total)
+        n = min(args.n, filtered_total)
         if args.strategy == "first":
             subset = clips[:n]
         else:
@@ -77,7 +85,13 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out_index, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote {len(subset)}/{total} clips to {out_path}")
+    if args.source is None:
+        print(f"Wrote {len(subset)}/{total} clips to {out_path}")
+    else:
+        print(
+            f"Wrote {len(subset)}/{filtered_total} filtered clips "
+            f"(source='{args.source}', original total={total}) to {out_path}"
+        )
 
 
 if __name__ == "__main__":
