@@ -62,7 +62,7 @@ class Args(BaseModel):
     ########## LoRA ##########
     rank: int = 64
     lora_alpha: int = 32
-    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0"]
+    target_modules: List[str] = ["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"]
     zcl_layers: List[int] = [3, 11, 19, 27, 35]
 
     ########## Validation ##########
@@ -173,7 +173,12 @@ class Args(BaseModel):
         # LoRA
         p.add_argument("--rank", type=int, default=64)
         p.add_argument("--lora_alpha", type=int, default=32)
-        p.add_argument("--target_modules", type=str, nargs="+", default=["to_q", "to_k", "to_v", "to_out.0"])
+        p.add_argument(
+            "--target_modules",
+            type=str,
+            nargs="+",
+            default=["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"],
+        )
         p.add_argument(
             "--zcl_layers",
             type=str,

@@ -233,7 +233,7 @@ class Trainer:
 
             self.__prepare_saving_loading_hooks(transformer_lora_config, adapter_names=("rgb", "xyz"))
             for name, param in self.components.transformer.named_parameters():
-                if 'zcl_' in name or 'lora_' in name:
+                if "zcl_" in name or "lora_" in name or "patch_embedding_xyz" in name:
                     param.requires_grad_(True)
                     logger.info(f"Training {name} after adding LoRA")
 
@@ -408,6 +408,7 @@ class Trainer:
             f"    step-NNNNNN/\n"
             f"      lora_adapters.pt                  # LoRA adapter weights (rgb/xyz)\n"
             f"      zcl_links.pt                      # ZCL control-link parameters\n"
+            f"      patch_embedding_xyz.pt            # XYZ branch 16ch patch embedding\n"
             f"      optimizer.bin        # Optimizer state\n"
             f"      scheduler.bin        # LR scheduler state\n"
             f"      random_states_*.pkl  # RNG states for reproducibility\n"
@@ -1066,6 +1067,13 @@ class Trainer:
                 if zcl_state is not None:
                     torch.save(zcl_state, os.path.join(output_dir, "zcl_links.pt"))
 
+                # Save XYZ patch embedding (independent 16ch conv)
+                if hasattr(model, "patch_embedding_xyz"):
+                    torch.save(
+                        model.patch_embedding_xyz.state_dict(),
+                        os.path.join(output_dir, "patch_embedding_xyz.pt"),
+                    )
+
         def load_model_hook(models, input_dir):
             if not self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 while len(models) > 0:
@@ -1117,6 +1125,14 @@ class Trainer:
                     transformer_.zcl_rgb_from_xyz.load_state_dict(zcl_state["zcl_rgb_from_xyz"], strict=False)
                 if hasattr(transformer_, "zcl_xyz_from_rgb") and "zcl_xyz_from_rgb" in zcl_state:
                     transformer_.zcl_xyz_from_rgb.load_state_dict(zcl_state["zcl_xyz_from_rgb"], strict=False)
+
+            # Load XYZ patch embedding if present (checkpoints saved after this change)
+            pe_xyz_path = os.path.join(input_dir, "patch_embedding_xyz.pt")
+            if os.path.exists(pe_xyz_path) and hasattr(transformer_, "patch_embedding_xyz"):
+                transformer_.patch_embedding_xyz.load_state_dict(
+                    torch.load(pe_xyz_path, map_location="cpu", weights_only=True),
+                    strict=True,
+                )
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)

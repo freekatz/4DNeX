@@ -41,7 +41,7 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
     """
 
     _supports_gradient_checkpointing = True
-    _skip_layerwise_casting_patterns = ["patch_embedding", "condition_embedder", "norm"]
+    _skip_layerwise_casting_patterns = ["patch_embedding", "patch_embedding_xyz", "condition_embedder", "norm"]
     _no_split_modules = ["WanTransformerBlock"]
     _keep_in_fp32_modules = ["time_embedder", "scale_shift_table", "norm1", "norm2", "norm3"]
     _keys_to_ignore_on_load_unexpected = ["norm_added_q"]
@@ -100,6 +100,15 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
                 )
                 for _ in range(num_layers)
             ]
+        )
+
+        # XYZ branch: independent patch embedding (16 ch only, no condition padding).
+        # Initialized from pretrained in from_pretrained(); allows XYZ to learn its own input mapping.
+        self.patch_embedding_xyz = nn.Conv3d(
+            16,
+            inner_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
         )
 
         # ZCL: lightweight bidirectional control links at selected DiT layers.
@@ -261,11 +270,12 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
         # Standard RoPE — shared by both branches (same spatial dims).
         rotary_emb = self.rope(hidden_states)
 
-        # Patch-embed each branch independently through the SAME patch_embedding.
+        # RGB: shared patch_embedding (36 ch = noisy + condition + mask).
         tokens_rgb = self.patch_embedding(hidden_states)
         tokens_rgb = tokens_rgb.flatten(2).transpose(1, 2)  # [B, N, D]
 
-        tokens_xyz = self.patch_embedding(hidden_states_xyz)
+        # XYZ: independent patch_embedding (16 ch = noisy latent only; no zero-padded condition).
+        tokens_xyz = self.patch_embedding_xyz(hidden_states_xyz[:, :16, :, :, :])
         tokens_xyz = tokens_xyz.flatten(2).transpose(1, 2)  # [B, N, D]
 
         # Condition embeddings (shared by both branches).
@@ -335,41 +345,57 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """Load model weights and materialize missing ZCL params if needed.
+        """Load pretrained weights; materialize & initialize new parameters.
 
-        With low_cpu_mem_usage/meta initialization, newly introduced parameters
-        (zcl_*) that are absent from checkpoint can remain on meta tensors.
-        DeepSpeed later fails when moving such tensors to real devices.
+        Parameters absent from checkpoint (ZCL links, patch_embedding_xyz)
+        may remain on meta device when loaded with low_cpu_mem_usage=True.
+        This method materializes them on CPU and applies proper initialization.
         """
         model = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-        # Pick a stable dtype from any non-meta parameter.
-        param_dtype = None
-        for p in model.parameters():
-            if not getattr(p, "is_meta", False):
-                param_dtype = p.dtype
-                break
-        if param_dtype is None:
-            param_dtype = torch.float32
-
-        def _materialize_linear_if_meta(linear: nn.Linear) -> None:
-            if getattr(linear.weight, "is_meta", False):
-                weight = torch.zeros(
-                    (linear.out_features, linear.in_features),
-                    dtype=param_dtype,
-                    device="cpu",
-                )
-                linear.weight = nn.Parameter(weight, requires_grad=linear.weight.requires_grad)
-            if linear.bias is not None and getattr(linear.bias, "is_meta", False):
-                bias = torch.zeros((linear.out_features,), dtype=param_dtype, device="cpu")
-                linear.bias = nn.Parameter(bias, requires_grad=linear.bias.requires_grad)
-
-        for linear in model.zcl_rgb_from_xyz.values():
-            _materialize_linear_if_meta(linear)
-        for linear in model.zcl_xyz_from_rgb.values():
-            _materialize_linear_if_meta(linear)
-
+        cls._materialize_new_params(model)
         return model
+
+    @staticmethod
+    def _materialize_new_params(model: "WanTransformer3DModelDualBranch") -> None:
+        """Materialize & initialize all parameters not present in checkpoint."""
+        param_dtype = next(
+            (p.dtype for p in model.parameters() if not getattr(p, "is_meta", False)),
+            torch.float32,
+        )
+
+        def _materialize_param(param: nn.Parameter, shape: tuple) -> nn.Parameter:
+            """Replace a meta Parameter with a zero-filled CPU tensor."""
+            if not getattr(param, "is_meta", False):
+                return param
+            return nn.Parameter(
+                torch.zeros(shape, dtype=param_dtype, device="cpu"),
+                requires_grad=param.requires_grad,
+            )
+
+        # --- ZCL links (zero-initialized) ---
+        for module_dict in (model.zcl_rgb_from_xyz, model.zcl_xyz_from_rgb):
+            for linear in module_dict.values():
+                linear.weight = _materialize_param(linear.weight, linear.weight.shape)
+                if linear.bias is not None:
+                    linear.bias = _materialize_param(linear.bias, linear.bias.shape)
+
+        # --- XYZ patch embedding (initialized from RGB patch_embedding[:, :16]) ---
+        pe_rgb = model.patch_embedding
+        pe_xyz = model.patch_embedding_xyz
+
+        # Materialize: derive shape from the loaded RGB patch_embedding.
+        rgb_w = pe_rgb.weight  # [out_ch, in_ch=36, kt, kh, kw]
+        xyz_shape = (rgb_w.shape[0], 16, *rgb_w.shape[2:])
+        pe_xyz.weight = _materialize_param(pe_xyz.weight, xyz_shape)
+        if pe_xyz.bias is not None:
+            pe_xyz.bias = _materialize_param(pe_xyz.bias, (rgb_w.shape[0],))
+
+        # Initialize from RGB's first 16 input channels.
+        if not getattr(rgb_w, "is_meta", False):
+            with torch.no_grad():
+                pe_xyz.weight.data.copy_(rgb_w[:, :16].to(param_dtype))
+                if pe_rgb.bias is not None and not getattr(pe_rgb.bias, "is_meta", False):
+                    pe_xyz.bias.data.copy_(pe_rgb.bias.to(param_dtype))
 
 
 # Backward-compatibility alias

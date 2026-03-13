@@ -269,6 +269,19 @@ def load_pipeline(model_path, lora_path, lora_rank, zcl_layers, offload_mode, dt
     else:
         logger.warning(f"zcl_links.pt not found at {lora_path}; ZCL links remain zero-initialized")
 
+    # Load XYZ patch embedding if present (trained 16ch conv; from_pretrained inits from RGB patch_embedding)
+    pe_xyz_file = os.path.join(lora_path, "patch_embedding_xyz.pt")
+    if os.path.exists(pe_xyz_file) and hasattr(transformer, "patch_embedding_xyz"):
+        logger.info(f"Loading XYZ patch embedding from {pe_xyz_file}")
+        transformer.patch_embedding_xyz.load_state_dict(
+            torch.load(pe_xyz_file, map_location="cpu", weights_only=True),
+            strict=True,
+        )
+    elif hasattr(transformer, "patch_embedding_xyz"):
+        logger.warning(
+            f"patch_embedding_xyz.pt not found at {lora_path}; XYZ patch embedding remains from_pretrained init"
+        )
+
     # ZCL linears are initialized / loaded in fp32 (training dtype for trainable
     # params), but the rest of the transformer is in `dtype` (typically bf16).
     # Cast them to match so _apply_zcl doesn't hit a dtype mismatch.
