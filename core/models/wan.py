@@ -135,6 +135,38 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
 
         return hidden_states_rgb, hidden_states_xyz
 
+    def _get_peft_model(self) -> "WanTransformer3DModelDualBranch":
+        """Return the innermost model that holds PEFT adapters (unwrap DDP/DeepSpeed).
+        set_adapter must be called on this so the correct LoRA branch is active per block.
+        """
+        m: nn.Module = self
+        while hasattr(m, "module"):
+            m = m.module
+        return cast(WanTransformer3DModelDualBranch, m)
+
+    def _set_adapter_safe(self, adapter_name: str) -> None:
+        """Switch active LoRA adapter on the actual PEFT model (unwrapped)."""
+        if not USE_PEFT_BACKEND:
+            return
+        peft_model = self._get_peft_model()
+        if hasattr(peft_model, "set_adapter"):
+            peft_model.set_adapter(adapter_name)
+
+    def _make_ckpt_branch_fn(
+        self, block: nn.Module, adapter_name: str,
+    ):
+        """Build a closure that correctly captures *this* block for checkpoint recomputation.
+
+        Defining the closure inside a separate method creates a new scope per call,
+        so ``block`` is bound to the function parameter (captured by value at call
+        time) rather than the loop variable in ``forward()`` (which would be
+        late-bound to the last block).
+        """
+        def _branch(h, ehs, tp, re):
+            self._set_adapter_safe(adapter_name)
+            return block(h, ehs, tp, re)
+        return _branch
+
     def _run_decoupled_block(
         self,
         block: nn.Module,
@@ -145,16 +177,13 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
         rotary_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a single DiT block on both branches with adapter switching."""
-        if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-            self.set_adapter("rgb")
+        self._set_adapter_safe("rgb")
         hidden_states_rgb = block(hidden_states_rgb, encoder_hidden_states, timestep_proj, rotary_emb)
 
-        if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-            self.set_adapter("xyz")
+        self._set_adapter_safe("xyz")
         hidden_states_xyz = block(hidden_states_xyz, encoder_hidden_states, timestep_proj, rotary_emb)
 
-        if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-            self.set_adapter("rgb")
+        self._set_adapter_safe("rgb")
 
         return hidden_states_rgb, hidden_states_xyz
 
@@ -253,36 +282,26 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
             # Gradient checkpointing: run two separate forwards per block (RGB then XYZ).
             # This avoids packing/unpacking branches into a single tensor.
             for layer_idx, block in enumerate(self.blocks):
-                # Keep adapter switch inside checkpointed call so backward recomputation
-                # also uses the correct branch adapter.
-                def _rgb_branch(h, ehs, tp, re):
-                    if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-                        self.set_adapter("rgb")
-                    return block(h, ehs, tp, re)
-
+                # _make_ckpt_branch_fn creates a new scope per call, binding
+                # *this* block to the closure so backward recomputation uses the
+                # correct layer (not the last block from the loop).
                 tokens_rgb = self._gradient_checkpointing_func(
-                    _rgb_branch,
+                    self._make_ckpt_branch_fn(block, "rgb"),
                     tokens_rgb,
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
                 )
 
-                def _xyz_branch(h, ehs, tp, re):
-                    if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-                        self.set_adapter("xyz")
-                    return block(h, ehs, tp, re)
-
                 tokens_xyz = self._gradient_checkpointing_func(
-                    _xyz_branch,
+                    self._make_ckpt_branch_fn(block, "xyz"),
                     tokens_xyz,
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
                 )
 
-                if USE_PEFT_BACKEND and hasattr(self, "set_adapter"):
-                    self.set_adapter("rgb")
+                self._set_adapter_safe("rgb")
 
                 tokens_rgb, tokens_xyz = self._apply_zcl(tokens_rgb, tokens_xyz, layer_idx)
         else:
