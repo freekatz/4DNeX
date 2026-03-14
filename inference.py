@@ -14,6 +14,13 @@ import datetime
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Set GPU before importing torch
+_early_parser = argparse.ArgumentParser()
+_early_parser.add_argument("--gpu_id", type=str, default=None, help="GPU id(s), e.g. 0 or 0,1. Sets CUDA_VISIBLE_DEVICES.")
+_early, _ = _early_parser.parse_known_args()
+if _early.gpu_id is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _early.gpu_id
+
 import imageio
 import numpy as np
 import torch
@@ -620,6 +627,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate RGB + XYZ from a single image")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt string or path to prompt list file")
     parser.add_argument("--image", type=str, default=None, help="Image path or path to image list file")
+    parser.add_argument("--gpu_id", type=str, default=None,
+                        help="GPU id(s) to use, e.g. 0 or 0,1. Sets CUDA_VISIBLE_DEVICES before loading models.")
     parser.add_argument("--clip_dir", type=str, default=None,
                         help="Clip directory (reads caption.txt + first_frame.png). "
                              "Can be a single clip or parent dir with multiple clip_* subdirs")
