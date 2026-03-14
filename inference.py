@@ -180,8 +180,14 @@ def resolve_weights_path(args):
     raise ValueError("Provide --weights_path (recommended) or --lora_path")
 
 
-def resolve_output_dir(base_out: str) -> str:
-    """Create a run-unique output directory by appending a timestamp suffix."""
+def resolve_output_dir(base_out: str, result_name: str | None = None) -> str:
+    """Resolve output directory.
+
+    If result_name is given (e.g. 'step-800'), use results/result-step-800.
+    Otherwise append a timestamp suffix for a unique run dir.
+    """
+    if result_name:
+        return os.path.join(base_out, f"result-{result_name}")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(base_out, f"result-{ts}")
 
@@ -358,7 +364,7 @@ def release_pipeline(pipe):
 
 def main(args):
     weights_path = resolve_weights_path(args)
-    run_out = resolve_output_dir(args.out)
+    run_out = resolve_output_dir(args.out, args.result_name)
     print(f"[Info] Output directory: {run_out}")
 
     if args.clip_dir is not None:
@@ -561,7 +567,9 @@ if __name__ == "__main__":
                         help="Path to training checkpoint/adapter directory (recommended, e.g. training/checkpoints/step-000010)")
     parser.add_argument("--lora_path", type=str, default=None,
                         help="Backward-compatible alias of --weights_path")
-    parser.add_argument("--out", type=str, default="results", help="Output directory prefix; timestamp suffix will be auto-appended")
+    parser.add_argument("--out", type=str, default="results", help="Output directory prefix")
+    parser.add_argument("--result_name", type=str, default=None,
+                        help="Explicit result folder name (e.g. step-800 -> results/result-step-800). If not set, a timestamp suffix is used")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
     parser.add_argument("--height", type=int, default=None, help="Output video height (must match model constraints)")
     parser.add_argument("--width", type=int, default=None, help="Output video width (must match model constraints)")
