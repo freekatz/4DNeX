@@ -101,13 +101,13 @@ export TOKENIZERS_PARALLELISM=false
 
 OUTPUT_DIR="./training"
 RUN_TS=$(date +"%Y%m%d_%H%M%S")
-LOG_DIR="$OUTPUT_DIR/logs"
-RUN_LOG="$LOG_DIR/finetune_${RUN_TS}.log"
-LATEST_LOG="$LOG_DIR/latest.log"
+# Tee log in base output dir; per-run log is written by Python to run root (output_dir/finetune.log)
+RUN_LOG="$OUTPUT_DIR/finetune_${RUN_TS}.log"
+LATEST_LOG="$OUTPUT_DIR/latest.log"
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$OUTPUT_DIR"
 
-echo "[finetune] Log file: $RUN_LOG"
+echo "[finetune] Tee log: $RUN_LOG (run-root log: <output_dir>/finetune.log)"
 
 accelerate launch \
     --config_file "$ACCEL_CONFIG" \
@@ -135,7 +135,7 @@ accelerate launch \
     "$@" \
     2>&1 | tee -a "$RUN_LOG"
 
-# Symlink latest log for convenience
-ln -sf "$(basename "$RUN_LOG")" "$LATEST_LOG"
+# Symlink latest tee log for convenience
+ln -sf "$(basename "$RUN_LOG")" "$LATEST_LOG" 2>/dev/null || true
 
 echo "END TIME: $(date)"

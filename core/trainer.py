@@ -91,7 +91,7 @@ class Trainer:
         self.state.using_deepspeed = self.accelerator.state.deepspeed_plugin is not None
 
     def _init_distributed(self):
-        logging_dir = Path(self.args.output_dir, "logs", "tensorboard")
+        logging_dir = Path(self.args.output_dir, "metrics", "tensorboard")
         project_config = ProjectConfiguration(project_dir=self.args.output_dir, logging_dir=logging_dir)
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         init_process_group_kwargs = InitProcessGroupKwargs(
@@ -114,7 +114,7 @@ class Trainer:
 
         # SwanLabTracker must be created after Accelerator (needs AcceleratorState).
         if self._use_swanlab_tracker:
-            swanlab_kwargs = {"logdir": str(self.args.output_dir / "logs" / "swanlab")}
+            swanlab_kwargs = {"logdir": str(self.args.output_dir / "metrics" / "swanlab")}
             if self.args.experiment_name:
                 swanlab_kwargs["experiment_name"] = self.args.experiment_name
             swanlab_tracker = SwanLabTracker(self.args.tracker_name, **swanlab_kwargs)
@@ -150,8 +150,18 @@ class Trainer:
             self.args.output_dir = Path(self.args.output_dir)
             self.args.output_dir.mkdir(parents=True, exist_ok=True)
             (self.args.output_dir / "checkpoints").mkdir(exist_ok=True)
-            (self.args.output_dir / "logs").mkdir(exist_ok=True)
+            (self.args.output_dir / "metrics").mkdir(exist_ok=True)
             (self.args.output_dir / "validation").mkdir(exist_ok=True)
+            # Log file in run root (e.g. .../hoi4d-200-20260313_210430/finetune.log)
+            log_file = self.args.output_dir / "finetune.log"
+            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+                    datefmt="%m/%d/%Y %H:%M:%S",
+                )
+            )
+            logging.getLogger(LOG_NAME).addHandler(file_handler)
 
     def check_setting(self) -> None:
         # Check for unload_list
@@ -412,10 +422,10 @@ class Trainer:
             f"      optimizer.bin        # Optimizer state\n"
             f"      scheduler.bin        # LR scheduler state\n"
             f"      random_states_*.pkl  # RNG states for reproducibility\n"
-            f"  logs/                # Training logs\n"
+            f"  metrics/             # TensorBoard & SwanLab outputs\n"
             f"    tensorboard/       # TensorBoard event files\n"
-            f"    finetune_*.log     # Full console logs\n"
-            f"    latest.log         # Symlink to most recent log\n"
+            f"    swanlab/           # SwanLab run data\n"
+            f"  finetune.log         # Training log (this run)\n"
             f"  validation/          # Validation outputs (step-NNNNNN/)\n"
             f"    step-NNNNNN/\n"
             f"      sample_NN_*.png  # Generated images\n"

@@ -282,13 +282,14 @@ def load_pipeline(model_path, lora_path, lora_rank, zcl_layers, offload_mode, dt
             f"patch_embedding_xyz.pt not found at {lora_path}; XYZ patch embedding remains from_pretrained init"
         )
 
-    # ZCL linears are initialized / loaded in fp32 (training dtype for trainable
-    # params), but the rest of the transformer is in `dtype` (typically bf16).
-    # Cast them to match so _apply_zcl doesn't hit a dtype mismatch.
+    # ZCL and patch_embedding_xyz are loaded in fp32; cast to inference dtype so
+    # forward (conv3d / linear) doesn't hit input (bf16) vs weight/bias (float) mismatch.
     if hasattr(transformer, "zcl_rgb_from_xyz"):
         transformer.zcl_rgb_from_xyz.to(dtype=dtype)
     if hasattr(transformer, "zcl_xyz_from_rgb"):
         transformer.zcl_xyz_from_rgb.to(dtype=dtype)
+    if hasattr(transformer, "patch_embedding_xyz"):
+        transformer.patch_embedding_xyz.to(dtype=dtype)
 
     # VAE memory optimization
     pipe.vae.enable_slicing()

@@ -26,6 +26,7 @@ data??
 data
 
 logs
+metrics/
 videos
 images
 *.mp4
@@ -33,6 +34,7 @@ images
 
 vis_data*/
 logs*/
+metrics*/
 
 .cache/
 pretrained
