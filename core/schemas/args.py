@@ -203,10 +203,9 @@ class Args(BaseModel):
         args = p.parse_args()
 
         # Always generate a timestamped experiment name for unique run identity.
-        # Examples:
-        #   my-exp -> my-exp-20260310_153000
-        #   (missing) -> default-20260310_153000
-        run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # In distributed launch, all ranks must share the same timestamp; prefer
+        # launcher-provided FINETRAINER_RUN_TS and fallback to current time.
+        run_ts = os.environ.get("FINETRAINER_RUN_TS") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         exp_prefix = args.experiment_name if args.experiment_name else "default"
         args.experiment_name = f"{exp_prefix}-{run_ts}"
 
