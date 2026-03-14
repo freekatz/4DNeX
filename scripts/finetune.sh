@@ -33,18 +33,18 @@ fi
 echo "[finetune] GPUs: $GPUS ($NUM_GPUS total), ZeRO mode: $ZERO_MODE"
 
 # ---- Select DeepSpeed config ----
-if [ "$ZERO_MODE" = "auto" ]; then
-    if [ "$NUM_GPUS" -eq 1 ]; then
-        DS_CONFIG="configs/zero2_offload.json"
-    else
-        DS_CONFIG="configs/zero2.json"
-    fi
-elif [ "$ZERO_MODE" = "offload" ]; then
+if [ "$ZERO_MODE" = "2" ]; then
+    DS_CONFIG="configs/zero2.json"
+elif [ "$ZERO_MODE" = "2_offload" ]; then
     DS_CONFIG="configs/zero2_offload.json"
+elif [ "$ZERO_MODE" = "3" ]; then
+    DS_CONFIG="configs/zero3.json"
+elif [ "$ZERO_MODE" = "3_offload" ]; then
+    DS_CONFIG="configs/zero3_offload.json"
 elif [ "$ZERO_MODE" = "none" ]; then
     DS_CONFIG=""
 else
-    echo "Unknown --zero mode: $ZERO_MODE (use: auto, offload, none)"
+    echo "Unknown --zero mode: $ZERO_MODE (use: 2, 2_offload, 3, 3_offload, none)"
     exit 1
 fi
 
