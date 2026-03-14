@@ -96,6 +96,52 @@ def save_pointmap(xyz_frames, rgb_frames, save_path):
         pickle.dump(pm, f)
 
 
+def write_2x2_video(gt_rgb_path, gt_xyz_path, pred_rgb_frames, pred_xyz_frames, out_path, fps, target_size=None):
+    """Write a single MP4 with 2x2 layout: top row GT RGB | GT XYZ, bottom row Pred RGB | Pred XYZ.
+
+    All four quads are resized to the same (H, W) if needed. Processes frame-by-frame to limit memory.
+    pred_*_frames: [F, H, W, 3] numpy, RGB in [0, 1] or [0, 255], XYZ in any scale.
+    """
+    from PIL import Image
+    reader_rgb = imageio.get_reader(gt_rgb_path)
+    reader_xyz = imageio.get_reader(gt_xyz_path)
+    n_pred = len(pred_rgb_frames)
+    writer = None
+    for idx, (fr, fx) in enumerate(zip(reader_rgb, reader_xyz)):
+        if idx >= n_pred:
+            break
+        fr = np.asarray(fr)
+        fx = np.asarray(fx)
+        pr = np.asarray(pred_rgb_frames[idx])
+        px = np.asarray(pred_xyz_frames[idx])
+        if pr.max() <= 1.0:
+            pr = (pr * 255).clip(0, 255).astype(np.uint8)
+        if px.max() <= 1.0:
+            px = (px * 255).clip(0, 255).astype(np.uint8)
+        h, w = pr.shape[0], pr.shape[1]
+        if target_size is None:
+            target_size = (w, h)
+        tw, th = target_size
+        if fr.shape[0] != th or fr.shape[1] != tw:
+            fr = np.array(Image.fromarray(fr).resize((tw, th), Image.Resampling.LANCZOS))
+        if fx.shape[0] != th or fx.shape[1] != tw:
+            fx = np.array(Image.fromarray(fx).resize((tw, th), Image.Resampling.LANCZOS))
+        if pr.shape[0] != th or pr.shape[1] != tw:
+            pr = np.array(Image.fromarray(pr).resize((tw, th), Image.Resampling.LANCZOS))
+        if px.shape[0] != th or px.shape[1] != tw:
+            px = np.array(Image.fromarray(px).resize((tw, th), Image.Resampling.LANCZOS))
+        top = np.concatenate([fr, fx], axis=1)
+        bottom = np.concatenate([pr, px], axis=1)
+        frame = np.concatenate([top, bottom], axis=0)
+        if writer is None:
+            writer = imageio.get_writer(str(out_path), fps=fps)
+        writer.append_data(frame)
+    if writer is not None:
+        writer.close()
+    reader_rgb.close()
+    reader_xyz.close()
+
+
 def get_latent_cache_path(cache_dir, index, prompt, image_path, args, weights_path):
     cache_key_raw = (
         f"idx={index}|prompt={prompt}|image={image_path}|"
@@ -139,7 +185,8 @@ def load_from_clip_dir(clip_dir):
         - Single clip dir: videos/{source}/{video_id}/{clip_id}/
         - Parent dir containing multiple clip_* subdirs
     Returns:
-        (prompt_list, image_list)
+        (prompt_list, image_list, clip_dirs) where clip_dirs[i] is the Path for sample i
+        (for merge_output: GT video.mp4 / xyz.mp4 live under clip_dirs[i]).
     """
     from pathlib import Path
     clip_dir = Path(clip_dir)
@@ -163,7 +210,7 @@ def load_from_clip_dir(clip_dir):
         prompt_list.append(caption_file.read_text(encoding="utf-8").strip())
         image_list.append(str(image_file))
 
-    return prompt_list, image_list
+    return prompt_list, image_list, clip_dirs
 
 
 def resolve_weights_path(args):
@@ -368,12 +415,16 @@ def main(args):
     print(f"[Info] Output directory: {run_out}")
 
     if args.clip_dir is not None:
-        prompt_list, image_list = load_from_clip_dir(args.clip_dir)
+        prompt_list, image_list, clip_dirs = load_from_clip_dir(args.clip_dir)
     else:
         if args.prompt is None or args.image is None:
             raise ValueError("Provide --clip_dir, or both --prompt and --image")
         prompt_list = load_list(args.prompt)
         image_list = load_list(args.image)
+        clip_dirs = None
+
+    if args.merge_output and (clip_dirs is None or not clip_dirs):
+        raise ValueError("--merge_output requires --clip_dir (GT video.mp4/xyz.mp4 per clip)")
 
     assert len(prompt_list) == len(image_list), \
         f"Prompt count ({len(prompt_list)}) != image count ({len(image_list)})"
@@ -507,6 +558,23 @@ def main(args):
         pkl_path = os.path.join(run_out, f'{i:05d}.pkl')
         save_pointmap(xyz_frames, rgb_frames, pkl_path)
 
+        # Optional: 2x2 merged video (top: GT RGB | GT XYZ, bottom: Pred RGB | Pred XYZ)
+        if args.merge_output and clip_dirs is not None:
+            clip_d = clip_dirs[i]
+            gt_rgb = clip_d / "video.mp4"
+            gt_xyz = clip_d / "xyz.mp4"
+            if gt_rgb.exists() and gt_xyz.exists():
+                merged_path = os.path.join(run_out, f'{i:05d}_merged.mp4')
+                print(f"  [{i}] Writing 2x2 merged video (GT top, pred bottom)...")
+                write_2x2_video(
+                    str(gt_rgb), str(gt_xyz),
+                    rgb_frames, xyz_frames,
+                    merged_path, args.fps,
+                )
+                print(f"  Saved merged: {merged_path}")
+            else:
+                print(f"  [{i}] Skip merged (missing {gt_rgb} or {gt_xyz})")
+
         print(f"  Saved: {rgb_path}, {xyz_path}, {pkl_path}")
 
         # Optional: post-processing with camera parameter optimization
@@ -558,6 +626,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip_dir", type=str, default=None,
                         help="Clip directory (reads caption.txt + first_frame.png). "
                              "Can be a single clip or parent dir with multiple clip_* subdirs")
+    parser.add_argument("--merge_output", action="store_true",
+                        help="Write an extra 2x2 video per sample: top row GT RGB | GT XYZ, bottom row Pred RGB | Pred XYZ. Requires --clip_dir with video.mp4 and xyz.mp4 in each clip.")
     parser.add_argument("--idx", type=int, default=-1, help="Process only this index (-1 for all)")
     parser.add_argument("--shard_id", type=int, default=0, help="Shard index for multi-GPU inference (0-based)")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
