@@ -25,9 +25,6 @@ from diffusers.models.transformers.transformer_wan import WanTransformer3DModel,
 logger = logging.get_logger(__name__)
 
 
-# Keep the old name as an alias for backward compatibility with trainer imports.
-WanTransformer3DModelDembSameRope = None  # Will be set after class definition
-
 
 class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
     """One4D dual-branch Wan Transformer.
@@ -397,6 +394,3 @@ class WanTransformer3DModelDualBranch(WanTransformer3DModel, ModelMixin):
                 if pe_rgb.bias is not None and not getattr(pe_rgb.bias, "is_meta", False):
                     pe_xyz.bias.data.copy_(pe_rgb.bias.to(param_dtype))
 
-
-# Backward-compatibility alias
-WanTransformer3DModelDembSameRope = WanTransformer3DModelDualBranch

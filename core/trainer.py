@@ -252,7 +252,21 @@ class Trainer:
         self.__move_components_to_device(dtype=weight_dtype, ignore_list=ignore_list)
 
         if self.args.gradient_checkpointing:
-            self.components.transformer.enable_gradient_checkpointing()
+            ds_plugin = self.accelerator.state.deepspeed_plugin
+            zero_stage = None
+            if ds_plugin is not None:
+                zero_stage = ds_plugin.deepspeed_config.get("zero_optimization", {}).get("stage")
+
+            # ZeRO-3 (+offload) may conflict with per-block adapter switching under
+            # torch activation checkpointing, causing metadata mismatch during backward
+            # recomputation (shape [D] vs [0]). Disable model GC in this mode.
+            if zero_stage == 3:
+                logger.warning(
+                    "Detected DeepSpeed ZeRO-3 with dual-adapter checkpointed blocks; "
+                    "disabling model gradient checkpointing to avoid torch.utils.checkpoint metadata mismatch."
+                )
+            else:
+                self.components.transformer.enable_gradient_checkpointing()
 
     def prepare_optimizer(self) -> None:
         logger.info("Initializing optimizer and lr scheduler")

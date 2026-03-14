@@ -103,13 +103,10 @@ OUTPUT_DIR="./training"
 RUN_TS=$(date +"%Y%m%d_%H%M%S")
 # Shared run timestamp for all distributed workers.
 export FINETRAINER_RUN_TS="$RUN_TS"
-# Tee log in base output dir; per-run log is written by Python to run root (output_dir/finetune.log)
-RUN_LOG="$OUTPUT_DIR/finetune_${RUN_TS}.log"
-LATEST_LOG="$OUTPUT_DIR/latest.log"
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "[finetune] Tee log: $RUN_LOG (run-root log: <output_dir>/finetune.log)"
+echo "[finetune] Persistent log: <output_dir>/finetune.log"
 
 accelerate launch \
     --config_file "$ACCEL_CONFIG" \
@@ -134,10 +131,6 @@ accelerate launch \
     --checkpointing_steps 200 \
     --checkpointing_limit 2 \
     --do_validation false \
-    "$@" \
-    2>&1 | tee -a "$RUN_LOG"
-
-# Symlink latest tee log for convenience
-ln -sf "$(basename "$RUN_LOG")" "$LATEST_LOG" 2>/dev/null || true
+    "$@"
 
 echo "END TIME: $(date)"
