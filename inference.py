@@ -423,9 +423,6 @@ def main(args):
         image_list = load_list(args.image)
         clip_dirs = None
 
-    if args.merge_output and (clip_dirs is None or not clip_dirs):
-        raise ValueError("--merge_output requires --clip_dir (GT video.mp4/xyz.mp4 per clip)")
-
     assert len(prompt_list) == len(image_list), \
         f"Prompt count ({len(prompt_list)}) != image count ({len(image_list)})"
 
@@ -558,8 +555,8 @@ def main(args):
         pkl_path = os.path.join(run_out, f'{i:05d}.pkl')
         save_pointmap(xyz_frames, rgb_frames, pkl_path)
 
-        # Optional: 2x2 merged video (top: GT RGB | GT XYZ, bottom: Pred RGB | Pred XYZ)
-        if args.merge_output and clip_dirs is not None:
+        # 2x2 merged video when GT available (top: GT RGB | GT XYZ, bottom: Pred RGB | Pred XYZ)
+        if clip_dirs is not None:
             clip_d = clip_dirs[i]
             gt_rgb = clip_d / "video.mp4"
             gt_xyz = clip_d / "xyz.mp4"
@@ -626,8 +623,6 @@ if __name__ == "__main__":
     parser.add_argument("--clip_dir", type=str, default=None,
                         help="Clip directory (reads caption.txt + first_frame.png). "
                              "Can be a single clip or parent dir with multiple clip_* subdirs")
-    parser.add_argument("--merge_output", action="store_true",
-                        help="Write an extra 2x2 video per sample: top row GT RGB | GT XYZ, bottom row Pred RGB | Pred XYZ. Requires --clip_dir with video.mp4 and xyz.mp4 in each clip.")
     parser.add_argument("--idx", type=int, default=-1, help="Process only this index (-1 for all)")
     parser.add_argument("--shard_id", type=int, default=0, help="Shard index for multi-GPU inference (0-based)")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards (= number of GPUs)")
